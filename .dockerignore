@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+browser_profile/
+auth_state.json
+token.json
+orders_report.json
+*.md
+.gitignore
+test_gmail_auth.py

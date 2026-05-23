@@ -1,0 +1,9 @@
+.env
+auth_state.json
+token.json
+credentials.json
+browser_profile/
+__pycache__/
+.venv/
+orders_report.json
+*.pyc

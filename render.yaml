@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: flipkart-scraper
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    # Set these in Render dashboard → Environment:
+    envVars:
+      - key: FLIPKART_USERNAME
+        sync: false          # fill in Render dashboard
+      - key: GMAIL_CLIENT_ID
+        sync: false
+      - key: GMAIL_CLIENT_SECRET
+        sync: false
+      - key: GMAIL_TOKEN_JSON
+        sync: false          # paste contents of token.json after local OAuth setup
+      - key: FLIPKART_AUTH_STATE
+        sync: false          # paste contents of auth_state.json after first scrape
+      - key: HEADLESS
+        value: "true"

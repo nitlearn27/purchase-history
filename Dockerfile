@@ -20,6 +20,7 @@ COPY . .
 # Headless is always true in the container (no display available)
 ENV HEADLESS=true
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONIOENCODING=utf-8
 ENV PORT=10000
 
 EXPOSE 10000

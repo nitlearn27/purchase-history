@@ -4,88 +4,182 @@ This file provides guidance to Claude Code when working in this repository.
 
 ## Project Overview
 
-A Playwright-based automation script that logs into Flipkart with user credentials,
-scrapes the last 10 orders from the order history, expands each order into its
-constituent items (via "See all items"), and produces a per-product report containing:
+A Playwright-based automation service that logs into Flipkart via OTP (fetched
+automatically from Gmail using the Gmail API), scrapes the last 10 orders from the
+order history, expands each order into its constituent items (via "See all items"),
+and produces a per-product report containing:
 
-1. Purchase date- this may be same date for all product in a single order.
-2. Number of times that product appears across the last 10 orders
+1. Purchase date — may be the same for all products in a single order.
+2. Number of times that product appears across the last 10 orders.
+
+The project runs as a **Flask web service** — scraping is triggered via HTTP endpoints.
+It is designed for local development and cloud deployment on **Render** (Docker-based).
 
 ## Tech Stack
 
-**Language**: Python 3.10+ (preferred) or Node.js 18+
-**Browser automation**: Playwright (playwright for Python, or @playwright/test for Node)
-**Browser**: Chromium, headed mode by default (Flipkart login requires OTP interaction)
-**Config**: Credentials read from a local .env file — never hardcoded, never committed
+| Concern | Choice |
+|---|---|
+| Language | Python 3.11 |
+| Browser automation | Playwright (async) + Chromium |
+| OTP retrieval | Gmail API (OAuth 2.0 Desktop app) — no email password needed |
+| Web service | Flask 3 |
+| Deployment | Render (Docker) |
+| Config | `.env` file locally; Render environment variables in production |
 
-## Environment Setup
-bash
-# Python
+## File Layout
+
+```
+.
+├── CLAUDE.md
+├── README.md
+├── Dockerfile               # Docker image for Render deployment
+├── render.yaml              # Render service configuration
+├── .env.example             # Template — no real values
+├── .gitignore
+├── .dockerignore
+├── requirements.txt
+├── app.py                   # Flask web service (entry point)
+├── scrape_flipkart_orders.py  # Core scraping logic
+└── test_gmail_auth.py       # Standalone Gmail API auth test
+```
+
+## Environment Variables
+
+### Required (local `.env` and Render dashboard)
+
+| Variable | Description |
+|---|---|
+| `FLIPKART_USERNAME` | Flipkart login email (same Gmail that receives OTP) |
+| `GMAIL_CLIENT_ID` | OAuth 2.0 Desktop app Client ID from Google Cloud Console |
+| `GMAIL_CLIENT_SECRET` | OAuth 2.0 Desktop app Client Secret |
+
+### Cloud-only (Render dashboard — populated after first local run)
+
+| Variable | Description |
+|---|---|
+| `GMAIL_TOKEN_JSON` | Full contents of `token.json` after local OAuth consent |
+| `FLIPKART_AUTH_STATE` | Full contents of `auth_state.json` after first successful scrape |
+
+### Optional overrides
+
+| Variable | Default |
+|---|---|
+| `GMAIL_TOKEN_FILE` | `token.json` |
+| `HEADLESS` | `false` locally, `true` in Docker |
+| `PORT` | `10000` (Render sets this automatically) |
+
+## Environment Setup (Local)
+
+```powershell
 python -m venv .venv
-source .venv/bin/activate     # Windows: .venv\Scripts\activate
-pip install playwright python-dotenv
+.venv\Scripts\activate
+pip install -r requirements.txt
 playwright install chromium
+```
 
-Create a .env file in the project root (and add it to .gitignore):
-FLIPKART_USERNAME=<email-or-phone>
-FLIPKART_PASSWORD=<password>
+Copy `.env.example` to `.env` and fill in `FLIPKART_USERNAME`, `GMAIL_CLIENT_ID`,
+`GMAIL_CLIENT_SECRET`.
 
-## Running
-bash
-python scrape_flipkart_orders.py            # headed, default 10 orders
-python scrape_flipkart_orders.py --headed=false   # headless (only if no OTP needed)
-python scrape_flipkart_orders.py --orders=10      # override order count
+### Gmail OAuth — one-time setup
 
-Output is written to orders_report.json and printed as a table to stdout.
+1. Go to [console.cloud.google.com](https://console.cloud.google.com)
+2. Create a project → Enable **Gmail API**
+3. **APIs & Services → Credentials → Create Credentials → OAuth client ID**
+   - Application type: **Desktop app** (NOT Web application)
+4. Copy Client ID and Client Secret into `.env`
+5. Run `python test_gmail_auth.py` — a browser opens for one-time Google consent
+6. After approval, `token.json` is saved — all future runs are silent
 
-## High-Level Flow
+> **Why Desktop app?** Desktop app OAuth clients automatically allow
+> `http://localhost:{any_port}` redirects. Web application clients require every
+> redirect URI to be explicitly registered, which breaks when the OAuth library
+> picks a random port.
 
-The script must follow this exact sequence. Do not skip steps.
+## Running Locally
 
-1. **Launch browser** (Chromium, headed, persistent context recommended so the session
-   can be reused without re-logging in on subsequent runs).
-2. **Navigate** to https://www.flipkart.com.
-3. **Dismiss** the login modal if one appears on landing (Flipkart sometimes shows one
-   immediately; sometimes you need to click the Login button manually).
-4. **Login** using the credentials from .env.
-   - Enter username/phone, click Continue, enter password, submit.
-   - If Flipkart asks for an OTP, **pause and wait for the user** to enter it manually
-     in the browser (do not attempt to bypass). Use page.wait_for_url on the post-login
-     home page, or wait for a known logged-in element (e.g. the account dropdown).
-5. **Navigate** to the orders page: `https://www.flipkart.com/account/orders`.
-6. **Collect the last 10 orders**. Orders are listed newest-first; take the first 10
-   visible order cards. If fewer than 10 exist, process whatever is there and note it
-   in the output.
-7. **For each order**: if the order card shows a "See all items" / "See N more items"
-   link (multi-item orders), click it to expand and capture every product inside.
-   Single-item orders need no expansion.
-8. **For each product** extract:
-   - Product title (used as the key to count repeats)
-   - Purchase date (or "Order placed on" date) — normalize to ISO YYYY-MM-DD
-9. **Aggregate** across all collected products: group by product title and compute the
-   purchase count. Each row in the final report represents one product occurrence
-   (date + total count of that product across the 10 orders).
-10. **Write** results to orders_report.json and print a summary table.
+### Start the web service
+
+```powershell
+$env:PORT="3000"; $env:HEADLESS="false"; .venv\Scripts\python.exe app.py
+```
+
+### API endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Liveness check |
+| `POST` | `/scrape` | Start a scrape (runs in background thread) |
+| `GET` | `/results` | Return latest scrape output or running status |
+
+```powershell
+# Trigger scrape
+Invoke-RestMethod -Method POST -Uri http://localhost:3000/scrape `
+  -ContentType "application/json" -Body '{"orders": 10}'
+
+# Poll for results (scrape takes ~2–5 minutes)
+Invoke-RestMethod http://localhost:3000/results
+```
+
+### Run the scraper directly (without Flask)
+
+```powershell
+.venv\Scripts\python.exe scrape_flipkart_orders.py           # headed, 10 orders
+.venv\Scripts\python.exe scrape_flipkart_orders.py --orders=5
+.venv\Scripts\python.exe scrape_flipkart_orders.py --headed=false  # headless
+```
+
+### Test Gmail API auth
+
+```powershell
+.venv\Scripts\python.exe test_gmail_auth.py        # steps 1–3
+.venv\Scripts\python.exe test_gmail_auth.py --otp  # also search for OTP email
+```
+
+## High-Level Scraping Flow
+
+1. **Gmail API authenticates** silently using `token.json` (or prompts browser
+   consent on first run).
+2. **Launch Chromium** (headed locally, headless in Docker) with a persistent
+   browser profile for session reuse.
+3. **Navigate** to `https://www.flipkart.com`.
+4. **Login via OTP** (fully automated):
+   - Detect and open the login form (modal auto-open, or click Login in nav).
+   - Enter `FLIPKART_USERNAME`.
+   - Click "Request OTP".
+   - Poll Gmail API every 6 s (up to 90 s) for a Flipkart email received after
+     the OTP was requested; extract the 6-digit OTP.
+   - Fill OTP (single input or 6 digit-box layout) → submit.
+5. **Save session** to `auth_state.json` (skips login on subsequent runs).
+6. **Navigate** to `https://www.flipkart.com/account/orders`.
+7. **Scroll** until 10 order cards are loaded (lazy-load aware).
+8. **For each order**: click "See all items" / "View all items" if present.
+9. **Extract** product title + purchase date from each card.
+10. **Aggregate** by product title; write `orders_report.json`; print table.
 
 ## Selector Strategy
 
-Flipkart's DOM uses hashed CSS class names (e.g. _1AtVbE) that change frequently.
-**Never rely on those class names alone.** Prefer, in this order:
+Flipkart's DOM uses hashed CSS class names that change frequently.
+**Never rely on those class names alone.** Use this priority order:
 
-1. Role + accessible name: page.get_by_role("button", name="Login")
-2. Visible text: page.get_by_text("See all items", exact=False)
-3. Stable test attributes if present (data-testid, data-tkid)
-4. Structural XPath anchored on visible labels as a last resort
-5. Hashed class names — only with a comment explaining the fallback and a TODO to
-   replace
+1. `placeholder*=` attribute matching (most stable for inputs)
+2. Role + accessible name: `page.get_by_role("button", name="Login")`
+3. Visible text: `page.get_by_text("See all items", exact=False)`
+4. Stable attributes if present (`data-testid`, `data-tkid`)
+5. Structural selectors anchored on visible text as last resort
+6. Hashed class names — only as fallback, with a `# TODO: replace` comment
 
-When a selector fails, log the page URL and the surrounding HTML snippet, then exit
-non-zero. Do not silently continue with empty data.
+All selectors are centralised in the `SELECTORS` dict at the top of
+`scrape_flipkart_orders.py`. Update there and nowhere else.
+
+When a selector fails:
+- Save a screenshot (`login_debug.png` or `otp_debug.png`) for diagnosis.
+- Log the current URL and a 600-char HTML snippet.
+- Exit non-zero. Do not silently continue with empty data.
 
 ## Expected Output Shape
 
-orders_report.json:
-json
+`orders_report.json`:
+```json
 {
   "scraped_at": "2026-05-23T10:15:00+05:30",
   "orders_scanned": 10,
@@ -97,57 +191,68 @@ json
     }
   ]
 }
+```
 
-The purchase_count_in_last_10_orders value is the same for every row of the same
-product title — it is a per-product aggregate repeated on each row, as the user
-requested.
+`purchase_count_in_last_10_orders` is the same for every row of the same product
+title — it is a per-product aggregate repeated on each occurrence row.
+
+## Render Deployment
+
+### How it works
+
+- Render builds the `Dockerfile` (Python 3.11-slim + Playwright Chromium).
+- On container start, `app.py` reads `GMAIL_TOKEN_JSON` and `FLIPKART_AUTH_STATE`
+  env vars and writes them to `token.json` / `auth_state.json` (Render's filesystem
+  is ephemeral — files reset on every restart).
+- Scraping runs headless inside the container.
+
+### Deploy steps
+
+1. Complete Gmail OAuth locally (`python test_gmail_auth.py`) → get `token.json`.
+2. Push code to GitHub.
+3. Render → **New Web Service** → connect repo → auto-detects `Dockerfile`.
+4. Add environment variables in Render dashboard (see table above).
+5. Set `GMAIL_TOKEN_JSON` = full contents of local `token.json`.
+6. After first successful scrape, Render logs print `auth_state.json` contents —
+   copy that value into `FLIPKART_AUTH_STATE` env var.
+
+### Session persistence on Render
+
+Since the filesystem is ephemeral, both credentials are stored as env vars:
+
+```
+Container starts
+  └─ app.py writes GMAIL_TOKEN_JSON  → token.json
+  └─ app.py writes FLIPKART_AUTH_STATE → auth_state.json  (if set)
+  └─ Scraper runs using those files normally
+  └─ After scrape: logs new auth_state.json so user can update env var
+```
 
 ## Important Constraints & Pitfalls
 
-**No credential logging.** Never print FLIPKART_PASSWORD or OTP values. Mask
-  the username in logs (e.g. show only the last 4 chars).
-**Respect Flipkart.** Use a single browser context, default Playwright user-agent,
-  human-paced clicks (page.wait_for_load_state("networkidle") between major
-  navigations, small asyncio.sleep/page.wait_for_timeout between scrolls). Do
-  not parallelize requests.
-**Captcha / OTP.** If a captcha or OTP screen appears, stop and surface a clear
-  message to the user. Never attempt to solve a captcha.
-**Lazy loading.** The orders page lazy-loads as you scroll. Scroll until at least
-  10 order cards are present in the DOM, or until no new cards load after 2 attempts.
-**"See all items" wording varies.** It may appear as "See all N items", "View all
-  items", or similar. Match on the leading word "See" or "View" plus the word "item".
-**Date parsing.** Flipkart shows dates like "Delivered on Mon, Apr 12th '26" or
-  "Order placed on 12 Apr 2026". Use a tolerant parser (e.g. dateutil.parser) and
-  fall back to extracting the first date-like substring.
-**Session reuse.** Persist storage_state to auth_state.json after first login
-  so reruns skip the login flow. Delete this file to force re-login.
-**.gitignore must include**: .env, auth_state.json, __pycache__/,
-  .venv/, orders_report.json (output is regenerated each run).
-
-## File Layout
-.
-├── CLAUDE.md
-├── README.md
-├── .env.example          # template, no real values
-├── .gitignore
-├── requirements.txt
-└── scrape_flipkart_orders.py
-
-## When Editing This Project
-
-Keep selectors centralized at the top of scrape_flipkart_orders.py in a
-  SELECTORS dict so they can be updated in one place when Flipkart changes its
-  markup.
-Every Playwright action that depends on a network response must have an explicit
-  wait (expect(...).to_be_visible() or page.wait_for_selector(...)) — never
-  sleep blindly except for human-pacing delays.
-Print progress to stdout in the form [order 3/10] expanding 'See all items'...
-  so the user can follow along during the headed run.
-If the script can't find the orders page (e.g. URL redirected to login), it
-  should re-run the login flow once, then give up if that also fails.
+- **No credential logging.** Never print OTP values. Mask the username
+  (show only last 4 chars).
+- **Respect Flipkart.** Single browser context, default Playwright user-agent,
+  human-paced clicks (`wait_for_load_state("networkidle")` between navigations,
+  small `wait_for_timeout` between scrolls). Do not parallelise requests.
+- **Captcha.** If a captcha appears, stop and surface a clear message. Never
+  attempt to solve a captcha automatically.
+- **Lazy loading.** Scroll until 10 order cards are in the DOM, or stop after
+  2 scroll attempts with no new cards.
+- **"See all items" wording varies.** Match on `(see|view).+item` (case-insensitive).
+- **Date parsing.** Flipkart shows dates like "Delivered on Mon, Apr 12th '26".
+  Use `dateutil.parser` with `fuzzy=True`; fall back to regex extraction.
+- **OTP timing.** Record a Unix timestamp just before clicking "Request OTP".
+  Pass it as the `after:` filter to Gmail API so stale OTP emails are ignored.
+- **Desktop app OAuth only.** The Gmail OAuth client MUST be type "Desktop app"
+  in Google Cloud Console. Web application clients require exact redirect URI
+  registration and break with random localhost ports.
+- **`.gitignore` must include**: `.env`, `auth_state.json`, `token.json`,
+  `browser_profile/`, `__pycache__/`, `.venv/`, `orders_report.json`,
+  `login_debug.png`, `otp_debug.png`.
 
 ## Out of Scope
 
-No purchase, cancel, return, or any write action on the account.
-No scraping beyond the 10 most recent orders unless --orders is explicitly
-  raised by the user.
+- No purchase, cancel, return, or any write action on the account.
+- No scraping beyond the 10 most recent orders unless `--orders` is explicitly raised.
+- No multi-user support — the service is single-tenant (one Flipkart account).

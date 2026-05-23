@@ -11,9 +11,16 @@ Endpoints:
 import asyncio
 import json
 import os
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Force UTF-8 stdout/stderr so unicode characters print on Windows
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
@@ -58,9 +65,10 @@ _state = {
 def _run_scrape(num_orders: int) -> None:
     """Blocking function executed in a background thread."""
     global _state
+    headless = os.getenv("HEADLESS", "true").lower() in ("true", "1", "yes")
     try:
         from scrape_flipkart_orders import run
-        asyncio.run(run(num_orders=num_orders, headless=True))
+        asyncio.run(run(num_orders=num_orders, headless=headless))
 
         report_path = Path("orders_report.json")
         if report_path.exists():
@@ -131,6 +139,101 @@ def results():
 
     return jsonify({"status": "ok", "last_run_at": _state["last_run_at"],
                     **_state["last_result"]}), 200
+
+
+# ---------------------------------------------------------------------------
+# Clean public API — GET to read, POST to refresh
+# ---------------------------------------------------------------------------
+
+def _shape_products() -> list[dict]:
+    """Return the latest scrape result in {product_name, date, number_of_times_purchased} format."""
+    result = _state.get("last_result") or {}
+    return [
+        {
+            "product_name": p["title"],
+            "date": p["purchase_date"],
+            "number_of_times_purchased": p["purchase_count_in_last_10_orders"],
+        }
+        for p in result.get("products", [])
+    ]
+
+
+@app.route("/api/products", methods=["GET"])
+def api_get_products():
+    """
+    Returns the products from the last 10 Flipkart orders in clean JSON.
+
+    Response (200) when data is available:
+      {
+        "scraped_at": "...",
+        "orders_scanned": 10,
+        "products": [
+          { "product_name": "...", "date": "YYYY-MM-DD", "number_of_times_purchased": 1 },
+          ...
+        ]
+      }
+
+    Response (202) if a scrape is currently running.
+    Response (404) if no scrape has been run yet — call POST /api/products to start one.
+    """
+    if _state["running"]:
+        return jsonify({
+            "status": "running",
+            "message": "A scrape is in progress. Try again in 2-5 minutes.",
+        }), 202
+
+    if _state["error"]:
+        return jsonify({
+            "status": "error",
+            "error": _state["error"],
+            "last_run_at": _state["last_run_at"],
+        }), 500
+
+    if _state["last_result"] is None:
+        return jsonify({
+            "status": "no_data",
+            "message": "No scrape has been run yet. POST /api/products to start one.",
+        }), 404
+
+    result = _state["last_result"]
+    return jsonify({
+        "scraped_at": result.get("scraped_at"),
+        "orders_scanned": result.get("orders_scanned", 0),
+        "products": _shape_products(),
+    }), 200
+
+
+@app.route("/api/products", methods=["POST"])
+def api_refresh_products():
+    """
+    Trigger a fresh scrape of the last 10 Flipkart orders.
+
+    Optional JSON body: { "orders": <int> }   (default: 10)
+
+    Returns immediately with status 202.
+    Poll GET /api/products until status switches from "running" to having data.
+    """
+    with _lock:
+        if _state["running"]:
+            return jsonify({
+                "status": "running",
+                "message": "A scrape is already in progress.",
+            }), 409
+
+        body = request.get_json(silent=True) or {}
+        num_orders = int(body.get("orders", 10))
+
+        _state["running"] = True
+        _state["error"] = None
+
+    thread = threading.Thread(target=_run_scrape, args=(num_orders,), daemon=True)
+    thread.start()
+
+    return jsonify({
+        "status": "started",
+        "orders_requested": num_orders,
+        "message": "Scrape started. Poll GET /api/products until results appear.",
+    }), 202
 
 
 # ---------------------------------------------------------------------------

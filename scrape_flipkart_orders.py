@@ -30,14 +30,18 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 SELECTORS = {
     # Flipkart: landing page modal
     "modal_close": "button[class*='close'], [class*='_2KpZ6l'], [class*='close-button']",
-    # Flipkart: login form
+    # Flipkart: login form input.
+    # The login input has NO placeholder — the visible "Enter Email/Mobile
+    # number" is a separate <label> element. We identify it by:
+    #  • The hashed class names Flipkart currently uses (most specific)
+    #  • As a fallback, any visible text input that is NOT the search bar
+    #    (search bar has name='q')
     "username_input": (
-        "input[type='text'][placeholder*='mail'], "
-        "input[type='tel'], "
-        "input[placeholder*='hone'], "
-        "input[placeholder*='ser']"
+        "input.xkp9Hl, "
+        "input.ZvCKfk, "
+        "input[type='text']:not([name='q']):not([type='hidden'])"
     ),
-    "request_otp_button": "button:has-text('Request OTP'), button:has-text('Continue')",
+    "request_otp_button": "button:has-text('Request OTP'), button:has-text('Continue'), button:has-text('GET OTP')",
     # OTP entry — single field variant
     "otp_input_single": (
         "input[placeholder*='OTP'], input[placeholder*='otp'], "
@@ -54,10 +58,11 @@ SELECTORS = {
         "a:has-text('My Account'), span:has-text('Account'), "
         "[class*='account'][href*='wishlist'], [class*='profileIcon']"
     ),
-    # Flipkart: orders page
+    # Flipkart: orders page — each order is a div.HetYBQ inside div.allJIf
     "order_card": (
-        "div[class*='_1YokD2'], div[class*='orderCard'], "
-        "div[class*='_2LjOP2'], div[class*='order-card']"
+        "div.HetYBQ, "
+        "div:has(> div > div > a[href*='order_details']), "
+        "div:has(> div > a[href*='order_details'])"
     ),
 }
 
@@ -164,7 +169,7 @@ def get_gmail_service(login_hint: str = ""):
                 login_hint=login_hint or None,
             )
 
-        GMAIL_TOKEN_FILE.write_text(creds.to_json())
+        GMAIL_TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
         print("[gmail] OAuth token saved to token.json.")
 
     return build("gmail", "v1", credentials=creds)
@@ -201,18 +206,42 @@ def _decode_gmail_body(message: dict) -> str:
     return b64decode(payload.get("body", {}).get("data", ""))
 
 
+def _extract_otp_from_message(msg: dict) -> str | None:
+    """
+    Return the 6-digit OTP from a Gmail message.
+    Flipkart puts the OTP in the SUBJECT (e.g. "215567 is your verification code"),
+    so we check subject first and only fall back to body.
+    """
+    headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+    subject = headers.get("Subject", "")
+
+    m = re.search(r"\b(\d{6})\b", subject)
+    if m:
+        return m.group(1)
+
+    body = _decode_gmail_body(msg)
+    m = re.search(r"\b(\d{6})\b", body)
+    if m:
+        return m.group(1)
+
+    return None
+
+
 def fetch_otp_via_gmail_api(
-    service, after_timestamp: int, max_wait_secs: int = 90
+    service, after_timestamp: int, max_wait_secs: int = 180
 ) -> str | None:
     """
     Synchronous function (runs in a thread).
-    Polls the Gmail API every 6 s for a Flipkart email that arrived after
-    `after_timestamp` (Unix seconds), extracts and returns a 6-digit OTP.
+    Polls Gmail every 6 s for a Flipkart verification email that arrived after
+    `after_timestamp` (Unix seconds); returns the 6-digit OTP from subject or body.
     """
     interval = 6
     attempts = max_wait_secs // interval
-    # Gmail API 'after:' accepts Unix timestamps
-    query = f"from:flipkart after:{after_timestamp}"
+    # Match Flipkart's actual sender domain (noreply@rmo.flipkart.com) and subject
+    query = (
+        f"(from:flipkart OR subject:verification OR subject:code) "
+        f"after:{after_timestamp}"
+    )
 
     print(f"[gmail] Polling Gmail API for Flipkart OTP (up to {max_wait_secs}s)…")
 
@@ -233,11 +262,10 @@ def fetch_otp_via_gmail_api(
                     .get(userId="me", id=stub["id"], format="full")
                     .execute()
                 )
-                body = _decode_gmail_body(msg)
-                match = re.search(r"\b(\d{6})\b", body)
-                if match:
-                    print("[gmail] 6-digit OTP found in Flipkart email.")
-                    return match.group(1)
+                otp = _extract_otp_from_message(msg)
+                if otp:
+                    print("[gmail] 6-digit OTP extracted from Flipkart email.")
+                    return otp
 
             remaining = max_wait_secs - (attempt + 1) * interval
             if messages:
@@ -302,54 +330,128 @@ async def enter_otp_on_flipkart(page, otp: str) -> None:
 
 async def save_auth(context) -> None:
     storage = await context.storage_state()
-    AUTH_STATE_FILE.write_text(json.dumps(storage, indent=2))
+    AUTH_STATE_FILE.write_text(json.dumps(storage, indent=2), encoding="utf-8")
     print("[auth] Flipkart session saved to auth_state.json.")
+
+
+async def _open_login_form(page) -> bool:
+    """
+    Make sure the Flipkart login input is visible.
+    Tries: use open modal → dismiss blocking overlay → click Login button.
+    Returns True when the input is visible.
+    """
+    input_loc = page.locator(SELECTORS["username_input"]).first
+
+    if await input_loc.is_visible():
+        return True
+
+    # Dismiss any overlay that isn't the login form itself
+    await dismiss_modal(page)
+    await page.wait_for_timeout(800)
+    if await input_loc.is_visible():
+        return True
+
+    # Try every plausible Login trigger
+    for sel in [
+        "a:has-text('Login')",
+        "button:has-text('Login')",
+        "li:has-text('Login') a",
+        "a[href*='login']",
+        "[class*='login']",
+    ]:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible():
+                await btn.click()
+                await page.wait_for_timeout(2_000)
+                if await input_loc.is_visible():
+                    return True
+        except Exception:
+            continue
+
+    # Last chance: wait up to 10 s for any matching input
+    try:
+        await input_loc.wait_for(state="visible", timeout=10_000)
+        return True
+    except PlaywrightTimeoutError:
+        return False
 
 
 async def login(page, flipkart_email: str, gmail_service) -> None:
     """
     Flipkart OTP login:
-      1. Enter email → click Request OTP
-      2. Fetch OTP from Gmail API (non-blocking via thread)
-      3. Enter OTP → verify
+      1. Try going to /account/orders directly. If we land there, we're logged in.
+      2. Otherwise, run the OTP flow: open login form → enter email → request OTP
+         → fetch OTP via Gmail API → enter OTP → verify.
     """
     print(f"[auth] Logging in to Flipkart as …{mask(flipkart_email)}")
 
-    await page.goto(FLIPKART_HOME, wait_until="domcontentloaded")
+    # Probe: try going straight to the orders page.
+    # If the session cookie from auth_state.json is valid, Flipkart serves it.
+    # If not, it redirects to a login page.
+    await page.goto(FLIPKART_ORDERS, wait_until="domcontentloaded")
     await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(1_500)
 
-    await dismiss_modal(page)
-
-    if await is_logged_in(page):
+    if "/account/orders" in page.url and "login" not in page.url.lower():
         print("[auth] Already logged in via saved session.")
         return
 
-    # Open login form
-    try:
-        btn = page.get_by_role("link", name=re.compile(r"^Login$", re.I)).or_(
-            page.get_by_role("button", name=re.compile(r"^Login$", re.I))
+    # Not logged in — go to home and run OTP flow
+    await page.goto(FLIPKART_HOME, wait_until="domcontentloaded")
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(1_500)
+
+    if not await _open_login_form(page):
+        screenshot_path = Path("login_debug.png")
+        await page.screenshot(path=str(screenshot_path))
+        # Dump every input on the page so we can fix the selector precisely
+        inputs_info = await page.evaluate("""
+            () => Array.from(document.querySelectorAll('input')).map(i => ({
+                type: i.type, name: i.name, placeholder: i.placeholder,
+                id: i.id, autocomplete: i.autocomplete,
+                cls: (i.className || '').slice(0, 60),
+                visible: !!(i.offsetParent || i.getClientRects().length),
+            }))
+        """)
+        print(
+            f"[error] Could not locate Flipkart login input after all attempts.\n"
+            f"  URL        : {page.url}\n"
+            f"  Screenshot : {screenshot_path.resolve()}\n"
+            f"  Inputs on page:"
         )
-        await btn.first.click(timeout=5_000)
-        await page.wait_for_timeout(1_500)
-    except PlaywrightTimeoutError:
-        pass
+        for i, info in enumerate(inputs_info):
+            print(f"    #{i}: {info}")
+        sys.exit(1)
+
+    # Snapshot of login form before typing — proves the form was found
+    await page.screenshot(path="step1_login_form.png")
+    print(f"[debug] Screenshot: step1_login_form.png ({Path('step1_login_form.png').resolve()})")
 
     # Enter email
     username_input = page.locator(SELECTORS["username_input"]).first
-    await username_input.wait_for(state="visible", timeout=12_000)
     await username_input.fill(flipkart_email)
+    print("[auth] Email entered.")
+    await page.screenshot(path="step2_email_entered.png")
+    print(f"[debug] Screenshot: step2_email_entered.png")
 
-    # Record time just before requesting OTP so we only pick up the fresh email
+    # Timestamp just before OTP request — filters out any older Flipkart emails
     otp_request_at = int(datetime.now(tz=timezone.utc).timestamp()) - 30
 
     # Click "Request OTP"
     otp_btn = page.locator(SELECTORS["request_otp_button"]).first
     await otp_btn.wait_for(state="visible", timeout=8_000)
+    otp_btn_text = (await otp_btn.inner_text()).strip()
+    print(f"[debug] Clicking button with text: '{otp_btn_text}'")
     await otp_btn.click()
-    await page.wait_for_timeout(2_000)
+    await page.wait_for_timeout(3_000)
     print("[auth] OTP requested from Flipkart.")
+    await page.screenshot(path="step3_after_otp_click.png")
+    print(f"[debug] Screenshot AFTER OTP click: step3_after_otp_click.png")
+    print(f"[debug] Current URL: {page.url}")
+    print(f"[debug] Page title: {await page.title()}")
 
-    # Fetch OTP via Gmail API in a background thread (keeps Playwright event loop alive)
+    # Fetch OTP via Gmail API in a background thread
     otp = await asyncio.to_thread(
         fetch_otp_via_gmail_api, gmail_service, otp_request_at
     )
@@ -357,9 +459,8 @@ async def login(page, flipkart_email: str, gmail_service) -> None:
     if not otp:
         print(
             "\n[error] Could not retrieve OTP from Gmail.\n"
-            "  • Ensure the Gmail API is enabled and credentials.json is correct.\n"
             "  • Check that the Flipkart OTP email landed in your inbox (not spam).\n"
-            "  • Delete token.json and re-run to redo the OAuth consent if needed.\n"
+            "  • Delete token.json and re-run to redo OAuth consent if needed.\n"
         )
         sys.exit(1)
 
@@ -374,7 +475,12 @@ async def login(page, flipkart_email: str, gmail_service) -> None:
     try:
         await page.wait_for_url(re.compile(r"flipkart\.com(?!/login)"), timeout=30_000)
     except PlaywrightTimeoutError:
-        print("[error] Login did not complete after OTP entry. OTP may have expired; try again.")
+        screenshot_path = Path("otp_debug.png")
+        await page.screenshot(path=str(screenshot_path))
+        print(
+            f"[error] Login did not complete after OTP.\n"
+            f"  Screenshot : {screenshot_path.resolve()}"
+        )
         sys.exit(1)
 
     await page.wait_for_load_state("networkidle")
@@ -429,50 +535,54 @@ async def extract_date_from_card(card) -> str:
     return "unknown"
 
 
+def _clean_product_title(raw: str) -> str:
+    """Strip 'X shared this order with you.' prefix and truncate before price/color/etc."""
+    title = re.sub(r"^[^.]+? shared this order with you\.\s*", "", raw, flags=re.I)
+    # Cut at first occurrence of any of: Color:, Size:, ₹, +<digits>, Delivered, Refund, Return, Cancelled
+    title = re.split(
+        r"\s*(?:Color:|Size:|₹|\+\d+|Delivered\s+on|Refund|Return\s|Cancelled|Your\s+item)",
+        title, maxsplit=1, flags=re.I,
+    )[0]
+    title = re.sub(r"\s+", " ", title).strip()
+    # Drop trailing ellipsis/punctuation
+    title = title.rstrip("…. ")
+    return title
+
+
+def _extract_date_from_text(text: str) -> str:
+    """Find a 'Delivered/Ordered/Shipped on <Date>' inside text → ISO YYYY-MM-DD."""
+    m = re.search(
+        r"(?:Delivered|Ordered|Shipped|Cancelled|Return\s+completed|Refund\s+completed)"
+        r"\s+on\s+([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{2,4})",
+        text, re.I,
+    )
+    if m:
+        return parse_date(m.group(1))
+    return "unknown"
+
+
 async def expand_and_get_products(page, card, order_idx: int, total: int) -> list[dict]:
-    see_all = await card.query_selector(
-        "a:has-text('See'), a:has-text('View'), span:has-text('See'), span:has-text('View')"
-    )
-    if see_all:
-        text = (await see_all.inner_text()).strip()
-        if re.search(r"(see|view).+item", text, re.I):
-            print(f"[order {order_idx}/{total}] Expanding '{text}'…")
-            await see_all.click()
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(800)
-
-    date = await extract_date_from_card(card)
-
-    title_els = await card.query_selector_all(
-        "a[class*='s1Q9rs'], a[class*='_2Kcoaa'], a[class*='IRpwTa'], "
-        "[class*='_3njFb'], [class*='_2cLu-l'], a[title], "
-        "div[class*='_3NwUo0'] a, p[class*='_2-ut94']"
-    )
-
+    # Each product inside an order has its own /order_details anchor.
+    anchors = await card.query_selector_all("a[href*='order_details']")
     products: list[dict] = []
-    seen: set[str] = set()
-    for el in title_els:
-        raw = (await el.inner_text()).strip() or (await el.get_attribute("title") or "").strip()
-        title = re.sub(r"\s+", " ", raw).strip()
-        if title and title not in seen:
-            seen.add(title)
-            products.append({"title": title, "date": date})
+    seen_item_ids: set[str] = set()
 
-    if not products:
-        for link in await card.query_selector_all("a"):
-            t = (await link.inner_text()).strip()
-            if len(t) > 10 and t not in seen:
-                seen.add(t)
-                products.append({"title": t, "date": date})
-                if len(products) >= 10:
-                    break
+    for anchor in anchors:
+        href = (await anchor.get_attribute("href")) or ""
+        m = re.search(r"item_id=([A-Z0-9]+)", href)
+        item_id = m.group(1) if m else href
+        if item_id in seen_item_ids:
+            continue
+        seen_item_ids.add(item_id)
 
-    if not products:
-        print(f"[order {order_idx}/{total}] WARNING: no product titles found.")
-        html = await card.inner_html()
-        print(f"  Card HTML snippet (first 600 chars):\n  {html[:600]}")
+        raw_text = (await anchor.inner_text()).strip()
+        title = _clean_product_title(raw_text)
+        date = _extract_date_from_text(raw_text)
 
-    print(f"[order {order_idx}/{total}] {len(products)} product(s), date={date}")
+        if title:
+            products.append({"item_id": item_id, "title": title, "date": date})
+
+    print(f"[order {order_idx}/{total}] {len(products)} product(s)")
     return products
 
 
@@ -494,13 +604,33 @@ async def run(num_orders: int, headless: bool) -> None:
     print("[gmail] Gmail API ready.")
 
     async with async_playwright() as pw:
-        context = await pw.chromium.launch_persistent_context(
-            "browser_profile",
+        # Browser args: --no-sandbox / --disable-dev-shm-usage are required when
+        # Chromium runs as root inside a Docker container (e.g. on Render).
+        browser_args = []
+        if headless:
+            browser_args = [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ]
+
+        browser = await pw.chromium.launch(
             headless=headless,
-            slow_mo=150,
-            viewport={"width": 1280, "height": 800},
+            slow_mo=400 if not headless else 0,
+            args=browser_args,
         )
-        page = context.pages[0] if context.pages else await context.new_page()
+
+        # Reuse the saved Flipkart session if auth_state.json exists.
+        # On Render, this file is written from FLIPKART_AUTH_STATE env var at startup.
+        storage_state = str(AUTH_STATE_FILE) if AUTH_STATE_FILE.exists() else None
+        if storage_state:
+            print(f"[auth] Restoring session from {AUTH_STATE_FILE}")
+
+        context = await browser.new_context(
+            storage_state=storage_state,
+            viewport={"width": 1400, "height": 900},
+        )
+        page = await context.new_page()
 
         # ---- Login ----
         await login(page, flipkart_email, gmail_service)
@@ -528,18 +658,84 @@ async def run(num_orders: int, headless: bool) -> None:
         print(f"[orders] Processing {actual_count} order(s).")
 
         if actual_count == 0:
-            print("[error] No order cards found.")
-            print(f"  URL: {page.url}")
-            print(f"  Page snippet:\n{(await page.content())[:800]}")
+            screenshot_path = Path("orders_debug.png")
+            await page.screenshot(path=str(screenshot_path), full_page=True)
+            # Walk up from product anchors to find the order card container
+            diagnostic = await page.evaluate("""
+                () => {
+                  // Order detail links (e.g. /dl/products/...?...orderId=OD123...)
+                  const orderAnchors = Array.from(document.querySelectorAll(
+                    'a[href*="orderId"], a[href*="/order"], a[href*="/dl/"]'
+                  )).slice(0, 5);
+
+                  const anchorInfo = orderAnchors.map(a => {
+                    const ancestors = [];
+                    let el = a;
+                    for (let i = 0; i < 6 && el; i++) {
+                      ancestors.push({
+                        tag: el.tagName,
+                        cls: (el.className || '').toString().slice(0, 80),
+                      });
+                      el = el.parentElement;
+                    }
+                    return { href: a.href.slice(0, 100), ancestors };
+                  });
+
+                  // Product thumbnails (Flipkart CDN)
+                  const productImgs = Array.from(document.querySelectorAll(
+                    'img[src*="rukmini"], img[src*="flixcart"]'
+                  )).slice(0, 3);
+
+                  const imgInfo = productImgs.map(img => {
+                    const ancestors = [];
+                    let el = img;
+                    for (let i = 0; i < 6 && el; i++) {
+                      ancestors.push({
+                        tag: el.tagName,
+                        cls: (el.className || '').toString().slice(0, 80),
+                      });
+                      el = el.parentElement;
+                    }
+                    return { src: img.src.slice(0, 60), ancestors };
+                  });
+
+                  return { anchorInfo, imgInfo, anchorCount: orderAnchors.length };
+                }
+            """)
+            print(
+                f"[error] No order cards found.\n"
+                f"  URL        : {page.url}\n"
+                f"  Screenshot : {screenshot_path.resolve()}\n"
+                f"  Order anchors on page: {diagnostic['anchorCount']}"
+            )
+            print(f"\n  === Order anchor ancestors (anchor -> parent -> grandparent -> ...) ===")
+            for i, info in enumerate(diagnostic["anchorInfo"]):
+                print(f"\n    Anchor #{i}: {info['href']}")
+                for level, a in enumerate(info["ancestors"]):
+                    print(f"      L{level}: {a['tag']:<6}  cls='{a['cls']}'")
+
+            print(f"\n  === Product image ancestors ===")
+            for i, info in enumerate(diagnostic["imgInfo"]):
+                print(f"\n    Image #{i}: {info['src']}...")
+                for level, a in enumerate(info["ancestors"]):
+                    print(f"      L{level}: {a['tag']:<6}  cls='{a['cls']}'")
+
             await context.close()
             sys.exit(1)
 
-        # ---- Extract products ----
+        # ---- Extract products, deduped globally by item_id ----
+        # Flipkart's orders page sometimes shows the same items in multiple cards
+        # (e.g. "All items" summary panels). Dedupe so each purchase is counted once.
         all_products: list[dict] = []
+        seen_item_ids_global: set[str] = set()
         for idx, card in enumerate(cards, start=1):
             try:
                 products = await expand_and_get_products(page, card, idx, actual_count)
-                all_products.extend(products)
+                for p in products:
+                    if p["item_id"] in seen_item_ids_global:
+                        continue
+                    seen_item_ids_global.add(p["item_id"])
+                    all_products.append(p)
             except Exception as exc:
                 print(f"[order {idx}/{actual_count}] Error: {exc}")
 
@@ -560,7 +756,10 @@ async def run(num_orders: int, headless: bool) -> None:
         "orders_scanned": actual_count,
         "products": report_products,
     }
-    ORDERS_REPORT_FILE.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+    ORDERS_REPORT_FILE.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     print(f"\n[done] Report written to {ORDERS_REPORT_FILE}")
 
     print(f"\n{'#':<4}  {'Product Title':<60}  {'Date':<12}  {'Count'}")

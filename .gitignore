@@ -7,3 +7,4 @@ __pycache__/
 .venv/
 orders_report.json
 *.pyc
+*.png

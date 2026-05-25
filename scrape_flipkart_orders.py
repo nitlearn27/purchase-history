@@ -705,53 +705,166 @@ async def _extract_availability(page) -> str:
 
 
 def _flipkart_pincode() -> str:
-    """Pincode to enter when Flipkart prompts for a delivery location.
-    Reads FLIPKART_PINCODE from .env; defaults to 560094."""
+    """Pincode used only as a last-resort fallback when no saved address can
+    be selected. Reads FLIPKART_PINCODE from .env; defaults to 560094."""
     return (os.getenv("FLIPKART_PINCODE") or "560094").strip()
 
 
-async def _set_pincode_if_prompted(page, pincode: str | None = None) -> bool:
-    """If the current page shows a pincode / area / delivery-address prompt,
-    fill it with `pincode` and submit. Returns True iff a pincode was entered.
+def _flipkart_saved_address_prefix() -> str:
+    """Text prefix that identifies the saved Flipkart address to prefer
+    whenever a product page asks for a delivery location. Matched against
+    the visible text of each saved-address card. Reads
+    FLIPKART_SAVED_ADDRESS_PREFIX from .env; defaults to '82, flat No 6'."""
+    return (os.getenv("FLIPKART_SAVED_ADDRESS_PREFIX") or "82, flat No 6").strip()
 
-    Flipkart shows this prompt in two situations:
-      1. On the hyperlocal-preview-page interstitial — entering a serviceable
-         pincode routes us to the real product page.
-      2. On the product page itself — gates the displayed price + availability
-         behind a delivery check.
 
-    Either way, the same helper handles it."""
-    pin = (pincode or _flipkart_pincode()).strip()
-    if not pin:
-        return False
+_PINCODE_PROMPT_SELECTORS = (
+    "input[placeholder*='pincode' i]",
+    "input[placeholder*='pin code' i]",
+    "input[placeholder*='delivery pincode' i]",
+    "input[placeholder*='enter pincode' i]",
+    "input[name*='pincode' i]",
+    "input[id*='pincode' i]",
+)
 
-    selectors = (
-        "input[placeholder*='pincode' i]",
-        "input[placeholder*='pin code' i]",
-        "input[placeholder*='delivery pincode' i]",
-        "input[placeholder*='enter pincode' i]",
-        "input[name*='pincode' i]",
-        "input[id*='pincode' i]",
-    )
 
-    pincode_input = None
-    for sel in selectors:
+async def _find_visible_pincode_input(page):
+    """Return the first visible pincode input on the page, or None."""
+    for sel in _PINCODE_PROMPT_SELECTORS:
         try:
             loc = page.locator(sel).first
             if await loc.count() == 0:
                 continue
             if not await loc.is_visible():
                 continue
-            pincode_input = loc
-            break
+            return loc
+        except Exception:
+            continue
+    return None
+
+
+async def _confirm_address_selection(page) -> None:
+    """After clicking a saved-address card, click any 'Deliver here' /
+    'Confirm' button that appears, then wait for the page to settle."""
+    for sel in (
+        "button:has-text('Deliver Here')",
+        "button:has-text('Deliver here')",
+        "button:has-text('Deliver to this address')",
+        "button:has-text('Confirm')",
+        "button:has-text('Apply')",
+    ):
+        try:
+            btn = page.locator(sel).first
+            if await btn.count() > 0 and await btn.is_visible():
+                await btn.click()
+                break
+        except Exception:
+            continue
+    try:
+        await page.wait_for_load_state("networkidle", timeout=6_000)
+    except PlaywrightTimeoutError:
+        pass
+    await page.wait_for_timeout(600)
+
+
+async def _click_saved_address_card(page, prefix: str) -> bool:
+    """Find a visible element whose text starts with `prefix` and click it.
+    Returns True iff something was clicked."""
+    # Use the first ~15 chars so partial address differences ("flat No 6"
+    # vs "Flat No.6", trailing comma vs no comma) still match. The prefix
+    # is unique enough on its own that prefix-only matching is safe.
+    snippet = prefix[:15]
+    pattern = re.compile(re.escape(snippet), re.I)
+    candidate = page.get_by_text(pattern).first
+    try:
+        if await candidate.count() == 0:
+            return False
+        try:
+            await candidate.scroll_into_view_if_needed()
+        except Exception:
+            pass
+        if not await candidate.is_visible():
+            return False
+        await candidate.click()
+        await page.wait_for_timeout(500)
+        await _confirm_address_selection(page)
+        return True
+    except Exception:
+        return False
+
+
+async def _select_saved_address_if_prompted(
+    page, address_prefix: str | None = None
+) -> bool:
+    """If the current page shows a pincode / delivery-address prompt, click
+    the saved address whose visible text starts with `address_prefix` rather
+    than typing a pincode. Returns True iff a saved address was selected.
+
+    Saved addresses are only available while logged in. Flipkart surfaces
+    them in two layouts:
+      1. Inline on the delivery-check widget — each saved address is its
+         own clickable card.
+      2. Behind a 'Saved Addresses' / 'Choose another address' link that
+         opens a panel listing all addresses.
+    This helper tries pass (1) first, then pass (2)."""
+    prefix = (address_prefix or _flipkart_saved_address_prefix()).strip()
+    if not prefix:
+        return False
+
+    if await _find_visible_pincode_input(page) is None:
+        return False
+
+    print(f"  [address] looking for saved address starting with {prefix[:15]!r}…")
+
+    # Pass 1: address card may already be visible alongside the pincode input.
+    if await _click_saved_address_card(page, prefix):
+        print(f"  [address] selected saved address starting with {prefix[:15]!r}.")
+        return True
+
+    # Pass 2: open a 'Saved Addresses' / 'Choose another address' panel first.
+    for trigger_sel in (
+        "a:has-text('Saved Addresses')",
+        "button:has-text('Saved Addresses')",
+        "a:has-text('saved address')",
+        "button:has-text('saved address')",
+        "a:has-text('Choose another address')",
+        "button:has-text('Choose another address')",
+        "a:has-text('Choose Address')",
+        "button:has-text('Choose Address')",
+        "a:has-text('Select Address')",
+        "button:has-text('Select Address')",
+        "a:has-text('Change Address')",
+        "button:has-text('Change Address')",
+        "a:has-text('View other addresses')",
+    ):
+        try:
+            trigger = page.locator(trigger_sel).first
+            if await trigger.count() == 0 or not await trigger.is_visible():
+                continue
+            await trigger.click()
+            await page.wait_for_timeout(800)
+            if await _click_saved_address_card(page, prefix):
+                print(f"  [address] selected saved address starting with {prefix[:15]!r}.")
+                return True
         except Exception:
             continue
 
+    return False
+
+
+async def _set_pincode_if_prompted(page, pincode: str | None = None) -> bool:
+    """Fallback for when no saved address can be picked. Fills the pincode
+    input and submits. Returns True iff a pincode was entered."""
+    pin = (pincode or _flipkart_pincode()).strip()
+    if not pin:
+        return False
+
+    pincode_input = await _find_visible_pincode_input(page)
     if pincode_input is None:
         return False
 
     try:
-        print(f"  [pincode] entering {pin}")
+        print(f"  [pincode] saved address unavailable — falling back to pincode {pin}")
         await pincode_input.scroll_into_view_if_needed()
         await pincode_input.fill(pin)
         await page.wait_for_timeout(400)
@@ -786,6 +899,16 @@ async def _set_pincode_if_prompted(page, pincode: str | None = None) -> bool:
     except Exception as exc:
         print(f"  [pincode] entry failed: {exc}")
         return False
+
+
+async def _set_delivery_location_if_prompted(page) -> bool:
+    """Resolve a Flipkart delivery-location prompt. Prefers selecting the
+    configured saved address; falls back to typing FLIPKART_PINCODE only if
+    the saved address cannot be located. Returns True iff either path
+    handled the prompt."""
+    if await _select_saved_address_if_prompted(page):
+        return True
+    return await _set_pincode_if_prompted(page)
 
 
 def _unwrap_preview_url(url: str) -> str:
@@ -835,12 +958,12 @@ async def extract_product_details(page) -> dict:
         pass
     await page.wait_for_timeout(600)
 
-    # If we landed on the hyperlocal interstitial, fill the pincode (which
-    # the interstitial usually asks for) — that often navigates us straight
-    # to the real product page. If a pincode prompt isn't there, fall back
-    # to following originalUrl directly.
+    # If we landed on the hyperlocal interstitial, resolve the delivery
+    # prompt (saved address preferred, pincode fallback) — that often
+    # navigates us straight to the real product page. If no prompt is
+    # there, fall back to following originalUrl directly.
     if "hyperlocal-preview-page" in page.url:
-        if await _set_pincode_if_prompted(page):
+        if await _set_delivery_location_if_prompted(page):
             try:
                 await page.wait_for_load_state("networkidle", timeout=6_000)
             except PlaywrightTimeoutError:
@@ -849,8 +972,8 @@ async def extract_product_details(page) -> dict:
         await _unwrap_hyperlocal_preview(page)
 
     # On the product page itself, the price + delivery availability are
-    # sometimes gated by a per-product pincode check. Fill it before extraction.
-    if await _set_pincode_if_prompted(page):
+    # sometimes gated by a per-product delivery check. Resolve it before extraction.
+    if await _set_delivery_location_if_prompted(page):
         # Price/availability typically update in-place after the check.
         await page.wait_for_timeout(800)
 

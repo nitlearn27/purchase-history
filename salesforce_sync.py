@@ -1,10 +1,13 @@
 """
 Sync scraped Flipkart purchase history to Salesforce Grocery_Product__c records.
 
-For each unique product title in the scrape result:
-  - Find the Grocery_Product__c record whose title__c matches the product title.
-  - If found, PATCH number_of_times_purchased__c and last_ordered_date__c.
-  - If not found, log and skip — new records are never created.
+For each unique product title in the scrape result we PATCH (upsert) by the
+external ID `title__c`:
+    PATCH /services/data/vXX.X/sobjects/Grocery_Product__c/title__c/<title>
+
+Salesforce returns 201 when a new record is created and 204 when an existing
+record is updated. `title__c` must be configured as an External ID
+(Unique, Case-Insensitive) on the object.
 
 Salesforce auth uses the OAuth 2.0 client_credentials flow against the Connected
 App identified by SF_CLIENT_ID / SF_CLIENT_SECRET.
@@ -35,9 +38,19 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+# External ID field — used in the upsert URL, NOT in the request body.
 TITLE_FIELD = "title__c"
+
+# Fields that get written on every upsert (when a value is available).
 COUNT_FIELD = "number_of_times_purchased__c"
 DATE_FIELD = "last_ordered_date__c"
+PRICE_FIELD = "current_price__c"
+URL_FIELD = "product_url__c"
+IMAGE_FIELD = "image_url__c"
+CATEGORY_FIELD = "category__c"
+AVAILABILITY_FIELD = "availability__c"
+SOURCE_FIELD = "source__c"
+SCRAPED_AT_FIELD = "scraped_at__c"
 
 _REQUIRED_ENV = ("SF_TOKEN_URL", "SF_CLIENT_ID", "SF_CLIENT_SECRET", "SF_API_ENDPOINT")
 _TOKEN_CACHE: dict[str, str] = {}
@@ -118,67 +131,103 @@ def _request(method: str, url: str, **kwargs) -> requests.Response:
     return resp
 
 
-def _query(soql: str) -> list[dict]:
-    url = f"{_instance_root()}{_api_version_path()}/query/?q={quote(soql)}"
-    resp = _request("GET", url)
-    if resp.status_code != 200:
-        raise SalesforceError(f"SOQL query failed: {resp.status_code} {resp.text[:300]}")
-    return resp.json().get("records", [])
-
-
-def _find_by_title(title: str) -> dict | None:
-    safe = title.replace("\\", "\\\\").replace("'", "\\'")
-    soql = (
-        f"SELECT Id, {TITLE_FIELD}, {COUNT_FIELD}, {DATE_FIELD} "
-        f"FROM Grocery_Product__c "
-        f"WHERE {TITLE_FIELD} = '{safe}' LIMIT 1"
-    )
-    records = _query(soql)
-    return records[0] if records else None
-
-
-def _patch(record_id: str, payload: dict) -> None:
-    url = f"{_sobject_base()}{record_id}"
+def _upsert_by_title(title: str, payload: dict) -> str:
+    """
+    PATCH /sobjects/Grocery_Product__c/title__c/<title>
+    Returns "created" (201) or "updated" (204/200).
+    """
+    encoded = quote(title, safe="")
+    url = f"{_instance_root()}{_api_version_path()}/sobjects/Grocery_Product__c/{TITLE_FIELD}/{encoded}"
     resp = _request("PATCH", url, json=payload)
-    if resp.status_code not in (200, 204):
-        raise SalesforceError(
-            f"Update {record_id} failed: {resp.status_code} {resp.text[:300]}"
-        )
+    if resp.status_code == 201:
+        return "created"
+    if resp.status_code in (200, 204):
+        return "updated"
+    raise SalesforceError(
+        f"Upsert {title[:60]} failed: {resp.status_code} {resp.text[:300]}"
+    )
+
+
+def _build_payload(entry: dict) -> dict:
+    """Build the upsert body. Omit None values so partial retries do not blank
+    existing fields. title__c is excluded — it lives in the URL."""
+    body: dict = {}
+
+    def put(field: str, value) -> None:
+        if value is None:
+            return
+        if isinstance(value, str) and not value.strip():
+            return
+        body[field] = value
+
+    put(COUNT_FIELD, entry.get("number_of_times_purchased"))
+    put(DATE_FIELD, entry.get("last_ordered_date"))
+    put(PRICE_FIELD, entry.get("current_price"))
+    put(URL_FIELD, entry.get("product_url"))
+    put(IMAGE_FIELD, entry.get("image_url"))
+    put(CATEGORY_FIELD, entry.get("category"))
+    put(AVAILABILITY_FIELD, entry.get("availability"))
+    put(SOURCE_FIELD, entry.get("source"))
+    put(SCRAPED_AT_FIELD, entry.get("scraped_at"))
+    return body
 
 
 def _dedupe(products: Iterable[dict]) -> list[dict]:
-    """One entry per title; keep the latest known date and the report's count."""
+    """Collapse duplicate titles, keep the latest date and highest count.
+
+    The scraper now emits one row per unique title, so this is mainly a safety
+    net for older report files or ad-hoc CLI runs."""
     grouped: dict[str, dict] = {}
     for p in products:
         title = (p.get("title") or "").strip()
         if not title:
             continue
-        raw_date = p.get("purchase_date")
-        date = raw_date if raw_date and raw_date != "unknown" else None
+
+        # Accept both the new keys and the legacy keys for backwards compat.
+        date = p.get("last_ordered_date") or p.get("purchase_date")
+        if date == "unknown":
+            date = None
+        count = p.get("number_of_times_purchased")
+        if count is None:
+            count = p.get("purchase_count_in_last_10_orders")
         try:
-            count = int(p.get("purchase_count_in_last_10_orders") or 0)
+            count = int(count or 0)
         except (TypeError, ValueError):
             count = 0
 
+        merged = dict(p)
+        merged["title"] = title
+        merged["last_ordered_date"] = date
+        merged["number_of_times_purchased"] = count
+
         cur = grouped.get(title)
         if cur is None:
-            grouped[title] = {"title": title, "last_ordered_date": date, "count": count}
+            grouped[title] = merged
             continue
-        if date and (cur["last_ordered_date"] is None or date > cur["last_ordered_date"]):
+        if date and (not cur.get("last_ordered_date") or date > cur["last_ordered_date"]):
             cur["last_ordered_date"] = date
-        cur["count"] = max(cur["count"], count)
+        cur["number_of_times_purchased"] = max(
+            cur.get("number_of_times_purchased") or 0, count
+        )
+        # Prefer non-empty values for the per-product page fields.
+        for k in (
+            "current_price", "product_url", "image_url",
+            "category", "availability", "source", "scraped_at",
+        ):
+            if not cur.get(k) and merged.get(k):
+                cur[k] = merged[k]
     return list(grouped.values())
 
 
 def sync_products(products: Iterable[dict]) -> dict:
     """
-    Sync `products` (rows from orders_report.json) to Salesforce.
+    Upsert `products` (rows from orders_report.json) into Grocery_Product__c.
 
-    Each row should expose: title, purchase_date, purchase_count_in_last_10_orders.
-    Returns a stats dict; never raises — errors are caught and logged so the
-    scrape pipeline does not fail if Salesforce is temporarily unavailable.
+    title__c acts as the external ID — records are created on first sight and
+    updated on subsequent runs. Returns a stats dict; never raises so a
+    transient Salesforce outage does not fail the scrape.
     """
-    stats = {"updated": 0, "not_found": 0, "errors": 0, "skipped": 0}
+    stats = {"created": 0, "updated": 0, "errors": 0, "skipped": 0}
 
     if not _config_present():
         missing = [k for k in _REQUIRED_ENV if not (os.getenv(k) or "").strip()]
@@ -191,36 +240,32 @@ def sync_products(products: Iterable[dict]) -> dict:
         print("[salesforce] No products to sync.")
         return stats
 
-    print(f"[salesforce] Syncing {len(deduped)} unique product(s) to Grocery_Product__c …")
+    print(f"[salesforce] Upserting {len(deduped)} unique product(s) into Grocery_Product__c …")
 
     for entry in deduped:
         title = entry["title"]
-        body: dict = {COUNT_FIELD: entry["count"]}
-        if entry["last_ordered_date"]:
-            body[DATE_FIELD] = entry["last_ordered_date"]
-
+        body = _build_payload(entry)
         try:
-            existing = _find_by_title(title)
-            if existing:
-                _patch(existing["Id"], body)
-                stats["updated"] += 1
-                print(
-                    f"  [updated]   {title[:60]:<60}  "
-                    f"count={entry['count']}  date={entry['last_ordered_date']}"
-                )
-            else:
-                stats["not_found"] += 1
-                print(f"  [not found] {title[:60]:<60}  skipped (no matching title__c)")
+            result = _upsert_by_title(title, body)
+            stats[result] += 1
+            tag = f"[{result}]".ljust(10)
+            print(
+                f"  {tag} {title[:55]:<55}  "
+                f"count={entry.get('number_of_times_purchased')}  "
+                f"date={entry.get('last_ordered_date')}  "
+                f"price={entry.get('current_price')}  "
+                f"avail={entry.get('availability')}"
+            )
         except SalesforceError as exc:
             stats["errors"] += 1
-            print(f"  [error]     {title[:60]} → {exc}")
+            print(f"  [error]    {title[:55]} → {exc}")
         except Exception as exc:
             stats["errors"] += 1
-            print(f"  [error]     {title[:60]} → unexpected: {exc}")
+            print(f"  [error]    {title[:55]} → unexpected: {exc}")
 
     print(
         f"[salesforce] Sync complete: "
-        f"{stats['updated']} updated, {stats['not_found']} not found, "
+        f"{stats['created']} created, {stats['updated']} updated, "
         f"{stats['errors']} errors."
     )
     return stats

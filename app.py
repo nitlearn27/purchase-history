@@ -6,7 +6,10 @@ Endpoints:
   GET  /health         → liveness check
   GET  /docs           → Swagger UI playground
   GET  /openapi.json   → OpenAPI 3.0 spec
-  GET  /api/products   → latest scrape output ({product_name, date, number_of_times_purchased})
+  GET  /api/products   → latest scrape output (full per-product field set:
+                         product_name, date, number_of_times_purchased,
+                         current_price, product_url, image_url, category,
+                         availability, source, scraped_at)
   POST /api/products   → start a scrape in a background thread (body: {"orders": <int>})
 """
 
@@ -125,16 +128,28 @@ def health():
 
 
 def _shape_products() -> list[dict]:
-    """Return the latest scrape result in {product_name, date, number_of_times_purchased} format."""
+    """Return the latest scrape result with the full per-product field set."""
     result = _state.get("last_result") or {}
-    return [
-        {
-            "product_name": p["title"],
-            "date": p["purchase_date"],
-            "number_of_times_purchased": p["purchase_count_in_last_10_orders"],
-        }
-        for p in result.get("products", [])
-    ]
+    out = []
+    for p in result.get("products", []):
+        # Tolerate legacy keys from older orders_report.json files.
+        date = p.get("last_ordered_date") or p.get("purchase_date")
+        count = p.get("number_of_times_purchased")
+        if count is None:
+            count = p.get("purchase_count_in_last_10_orders")
+        out.append({
+            "product_name": p.get("title"),
+            "date": date,
+            "number_of_times_purchased": count,
+            "current_price": p.get("current_price"),
+            "product_url": p.get("product_url"),
+            "image_url": p.get("image_url"),
+            "category": p.get("category"),
+            "availability": p.get("availability"),
+            "source": p.get("source"),
+            "scraped_at": p.get("scraped_at"),
+        })
+    return out
 
 
 @app.route("/api/products", methods=["GET"])
@@ -200,7 +215,8 @@ def api_refresh_products():
             }), 409
 
         body = request.get_json(silent=True) or {}
-        num_orders = int(body.get("orders", 10))
+        from scrape_flipkart_orders import default_orders_to_scrape
+        num_orders = int(body.get("orders", default_orders_to_scrape()))
 
         _state["running"] = True
         _state["error"] = None
@@ -226,10 +242,12 @@ _OPENAPI_SPEC = {
         "version": "1.0.0",
         "description": (
             "Flipkart order scraper + Salesforce `Grocery_Product__c` sync.\n\n"
-            "After every successful scrape, each unique product title is matched against "
-            "`Grocery_Product__c.title__c`. Matching records get `number_of_times_purchased__c` "
-            "and `last_ordered_date__c` updated. **No new records are ever created.**\n\n"
-            "A scrape runs in a background thread and typically takes 2–5 minutes. "
+            "After every successful scrape, the scraper drills into each unique product's "
+            "Flipkart page to capture current price, image, URL and availability, then "
+            "**upserts** each row into `Grocery_Product__c` using `title__c` as the "
+            "external ID — existing records are updated; new titles are inserted.\n\n"
+            "A scrape runs in a background thread and typically takes 3–8 minutes "
+            "(longer than before because every unique product page is visited). "
             "Poll `GET /api/products` until the status flips from `running` to `ok`."
         ),
     },
@@ -335,8 +353,11 @@ _OPENAPI_SPEC = {
                 "type": "object",
                 "properties": {
                     "orders": {
-                        "type": "integer", "minimum": 1, "maximum": 50, "default": 10,
-                        "description": "Number of recent Flipkart orders to scrape.",
+                        "type": "integer", "minimum": 1, "maximum": 50,
+                        "description": (
+                            "Number of recent Flipkart orders to scrape. "
+                            "If omitted, falls back to ORDERS_TO_SCRAPE from .env (default 10)."
+                        ),
                     },
                 },
             },
@@ -386,8 +407,15 @@ _OPENAPI_SPEC = {
                 "type": "object",
                 "properties": {
                     "product_name":              {"type": "string"},
-                    "date":                      {"type": "string", "example": "2026-04-12"},
+                    "date":                      {"type": "string", "nullable": True, "example": "2026-04-12"},
                     "number_of_times_purchased": {"type": "integer"},
+                    "current_price":             {"type": "number", "nullable": True, "example": 27.0},
+                    "product_url":               {"type": "string", "nullable": True, "example": "https://www.flipkart.com/.../p/itm..."},
+                    "image_url":                 {"type": "string", "nullable": True, "example": "https://rukminim2.flixcart.com/..."},
+                    "category":                  {"type": "string", "nullable": True, "example": "Grocery"},
+                    "availability":              {"type": "string", "nullable": True, "example": "Available"},
+                    "source":                    {"type": "string", "nullable": True, "example": "Flipkart"},
+                    "scraped_at":                {"type": "string", "format": "date-time", "nullable": True},
                 },
             },
         }

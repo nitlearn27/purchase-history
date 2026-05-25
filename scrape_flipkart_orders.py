@@ -64,6 +64,14 @@ SELECTORS = {
     # clicked to open their detail page (URL includes &grocery=true).
     # TODO: replace hashed class if Flipkart changes it
     "order_card": "div.ZcgLRi",
+    # Product-page link on an order_details page — `/p/itm…` is Flipkart's
+    # canonical product URL shape.
+    "product_link_on_order_detail": "a[href*='/p/itm']",
+    # On the product page itself — prefer attribute/text matches; hashed
+    # classes are a last-resort fallback.
+    # TODO: replace hashed class if Flipkart changes it
+    "product_price": "div.Nx9bqj, div._30jeq3, div[class*='price']",
+    "product_image": "img[src*='rukmini'], img[src*='flixcart']",
 }
 
 # ---------------------------------------------------------------------------
@@ -78,6 +86,20 @@ AUTH_STATE_FILE = Path("auth_state.json")
 ORDERS_REPORT_FILE = Path("orders_report.json")
 FLIPKART_HOME = "https://www.flipkart.com"
 FLIPKART_ORDERS = "https://www.flipkart.com/account/orders"
+
+
+def default_orders_to_scrape() -> int:
+    """Default number of orders to scrape. Reads ORDERS_TO_SCRAPE from the
+    environment (.env) and falls back to 10 when unset or invalid."""
+    raw = (os.getenv("ORDERS_TO_SCRAPE") or "").strip()
+    if not raw:
+        return 10
+    try:
+        n = int(raw)
+        return n if n > 0 else 10
+    except ValueError:
+        print(f"[config] ORDERS_TO_SCRAPE={raw!r} is not a valid integer; using 10.")
+        return 10
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +501,35 @@ async def login(page, flipkart_email: str, gmail_service) -> None:
     await page.wait_for_timeout(3_000)
     print("[auth] OTP requested from Flipkart.")
 
+    # Diagnostic: capture state right after the OTP click so we can tell
+    # whether Flipkart actually sent the OTP, or showed a captcha / block /
+    # silent error. On Render the screenshot file is ephemeral but visible
+    # text + URL show up in the logs, which is what we'll use to diagnose.
+    try:
+        screenshot_path = Path("otp_request_debug.png")
+        await page.screenshot(path=str(screenshot_path), full_page=True)
+        body_text = (await page.locator("body").inner_text())[:2000]
+        page_html_len = len(await page.content())
+        print(
+            f"[diag] Post-OTP-click page state:\n"
+            f"  URL          : {page.url}\n"
+            f"  HTML length  : {page_html_len}\n"
+            f"  Screenshot   : {screenshot_path.resolve()}\n"
+            f"  Visible text : {body_text!r}"
+        )
+        lowered = body_text.lower()
+        block_terms = [
+            "captcha", "verify you are human", "are you human",
+            "too many", "try again later", "blocked", "unusual activity",
+            "robot", "rate limit", "suspicious", "unable to send",
+            "could not send", "failed to send",
+        ]
+        hits = [t for t in block_terms if t in lowered]
+        if hits:
+            print(f"[diag] WARNING: Flipkart page contains block/captcha indicators: {hits}")
+    except Exception as exc:
+        print(f"[diag] Could not capture post-OTP diagnostics: {exc}")
+
     # Fetch OTP via Gmail API in a background thread
     otp = await asyncio.to_thread(
         fetch_otp_via_gmail_api, gmail_service, otp_request_at
@@ -581,10 +632,343 @@ def _clean_minutes_product_title(raw: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
-async def scrape_minutes_basket(page, card, order_idx: int, total: int) -> list[dict]:
+_UNAVAILABLE_TERMS = (
+    "sold out",
+    "out of stock",
+    "currently unavailable",
+    "coming soon",
+)
+
+
+def _unavailable_fields() -> dict:
+    return {
+        "current_price": None,
+        "product_url": None,
+        "image_url": None,
+        "availability": "Unavailable",
+    }
+
+
+async def _extract_current_price(page) -> float | None:
+    """Pick the most prominent ₹ price from the product page."""
+    for sel in (
+        "div.Nx9bqj.CxhGGd",            # current selling price (hashed)
+        SELECTORS["product_price"],     # broader fallback
+    ):
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() == 0:
+                continue
+            text = await loc.inner_text(timeout=2_000)
+            m = re.search(r"₹\s*([\d,]+(?:\.\d+)?)", text)
+            if m:
+                return float(m.group(1).replace(",", ""))
+        except Exception:
+            continue
+    try:
+        body = await page.locator("body").inner_text()
+        m = re.search(r"₹\s*([\d,]+(?:\.\d+)?)", body)
+        if m:
+            return float(m.group(1).replace(",", ""))
+    except Exception:
+        pass
+    return None
+
+
+async def _extract_main_image(page) -> str | None:
+    """Return the largest Flipkart CDN image — usually the product hero shot."""
+    try:
+        return await page.evaluate("""
+            () => {
+              const imgs = Array.from(document.querySelectorAll(
+                'img[src*="rukmini"], img[src*="flixcart"]'
+              )).filter(img => img.src && !img.src.includes('promos') && !img.src.includes('logos'));
+              if (!imgs.length) return null;
+              imgs.sort((a, b) => (b.naturalWidth || 0) - (a.naturalWidth || 0));
+              return imgs[0].src;
+            }
+        """)
+    except Exception:
+        return None
+
+
+async def _extract_availability(page) -> str:
+    """Two-state: 'Unavailable' if any sold-out marker is visible, else 'Available'."""
+    try:
+        body = (await page.locator("body").inner_text() or "").lower()
+        for term in _UNAVAILABLE_TERMS:
+            if term in body:
+                return "Unavailable"
+        return "Available"
+    except Exception:
+        return "Unavailable"
+
+
+def _flipkart_pincode() -> str:
+    """Pincode to enter when Flipkart prompts for a delivery location.
+    Reads FLIPKART_PINCODE from .env; defaults to 560094."""
+    return (os.getenv("FLIPKART_PINCODE") or "560094").strip()
+
+
+async def _set_pincode_if_prompted(page, pincode: str | None = None) -> bool:
+    """If the current page shows a pincode / area / delivery-address prompt,
+    fill it with `pincode` and submit. Returns True iff a pincode was entered.
+
+    Flipkart shows this prompt in two situations:
+      1. On the hyperlocal-preview-page interstitial — entering a serviceable
+         pincode routes us to the real product page.
+      2. On the product page itself — gates the displayed price + availability
+         behind a delivery check.
+
+    Either way, the same helper handles it."""
+    pin = (pincode or _flipkart_pincode()).strip()
+    if not pin:
+        return False
+
+    selectors = (
+        "input[placeholder*='pincode' i]",
+        "input[placeholder*='pin code' i]",
+        "input[placeholder*='delivery pincode' i]",
+        "input[placeholder*='enter pincode' i]",
+        "input[name*='pincode' i]",
+        "input[id*='pincode' i]",
+    )
+
+    pincode_input = None
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() == 0:
+                continue
+            if not await loc.is_visible():
+                continue
+            pincode_input = loc
+            break
+        except Exception:
+            continue
+
+    if pincode_input is None:
+        return False
+
+    try:
+        print(f"  [pincode] entering {pin}")
+        await pincode_input.scroll_into_view_if_needed()
+        await pincode_input.fill(pin)
+        await page.wait_for_timeout(400)
+
+        # Try common submit buttons near the input; fall back to pressing Enter.
+        clicked = False
+        for sel in (
+            "button:has-text('Check')",
+            "button:has-text('Apply')",
+            "button:has-text('Submit')",
+            "button:has-text('Continue')",
+            "button:has-text('Confirm')",
+            "button[type='submit']",
+        ):
+            try:
+                btn = page.locator(sel).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click()
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            await pincode_input.press("Enter")
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8_000)
+        except PlaywrightTimeoutError:
+            pass
+        await page.wait_for_timeout(800)
+        return True
+    except Exception as exc:
+        print(f"  [pincode] entry failed: {exc}")
+        return False
+
+
+def _unwrap_preview_url(url: str) -> str:
+    """If `url` is a Flipkart hyperlocal-preview-page wrapper, return the
+    decoded `originalUrl` (the canonical /<slug>/p/itm... URL). Otherwise
+    return `url` unchanged. Used to convert basket-tile anchor hrefs into
+    real product URLs without performing any navigation."""
+    if not url or "hyperlocal-preview-page" not in url:
+        return url or ""
+    from urllib.parse import urlparse, parse_qs, unquote
+    parsed = urlparse(url)
+    original = unquote((parse_qs(parsed.query).get("originalUrl") or [""])[0])
+    if not original:
+        return url
+    return original if original.startswith("http") else f"https://www.flipkart.com{original}"
+
+
+async def _unwrap_hyperlocal_preview(page) -> None:
+    """Flipkart routes Minutes product clicks through a 'hyperlocal-preview-page'
+    interstitial that doesn't render a price. The canonical product URL is
+    URL-encoded inside its `originalUrl` query param — follow it."""
+    if "hyperlocal-preview-page" not in page.url:
+        return
+    from urllib.parse import urlparse, parse_qs, unquote
+    parsed = urlparse(page.url)
+    original = unquote((parse_qs(parsed.query).get("originalUrl") or [""])[0])
+    if not original:
+        return
+    target = original if original.startswith("http") else f"https://www.flipkart.com{original}"
+    try:
+        await page.goto(target, wait_until="domcontentloaded")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=6_000)
+        except PlaywrightTimeoutError:
+            pass
+        await page.wait_for_timeout(600)
+    except Exception as exc:
+        print(f"  [unwrap] hyperlocal preview follow failed: {exc}")
+
+
+async def extract_product_details(page) -> dict:
+    """Capture price / image / url / availability from the currently-open product page."""
+    # Some product pages defer their price/image render — small idle wait helps.
+    try:
+        await page.wait_for_load_state("networkidle", timeout=6_000)
+    except PlaywrightTimeoutError:
+        pass
+    await page.wait_for_timeout(600)
+
+    # If we landed on the hyperlocal interstitial, fill the pincode (which
+    # the interstitial usually asks for) — that often navigates us straight
+    # to the real product page. If a pincode prompt isn't there, fall back
+    # to following originalUrl directly.
+    if "hyperlocal-preview-page" in page.url:
+        if await _set_pincode_if_prompted(page):
+            try:
+                await page.wait_for_load_state("networkidle", timeout=6_000)
+            except PlaywrightTimeoutError:
+                pass
+            await page.wait_for_timeout(600)
+        await _unwrap_hyperlocal_preview(page)
+
+    # On the product page itself, the price + delivery availability are
+    # sometimes gated by a per-product pincode check. Fill it before extraction.
+    if await _set_pincode_if_prompted(page):
+        # Price/availability typically update in-place after the check.
+        await page.wait_for_timeout(800)
+
+    return {
+        "current_price": await _extract_current_price(page),
+        "product_url": page.url,
+        "image_url": await _extract_main_image(page),
+        "availability": await _extract_availability(page),
+    }
+
+
+async def _click_into_product_from_current_page(page) -> bool:
+    """From an order_details (or Minutes detail) page, click into the product page.
+    Tries multiple selectors and accepts either the canonical `/p/itm…` URL
+    or Flipkart's `hyperlocal-preview-page` interstitial (the unwrapper
+    resolves that later). Returns True if a navigation happened."""
+    # Match the canonical path "<slug>/p/itm…" (path segment), OR the Minutes
+    # interstitial. Anchored to flipkart.com so the encoded `/p/itm` sitting
+    # inside an originalUrl query value does NOT match.
+    landed_pattern = re.compile(
+        r"flipkart\.com/[^?#]*?/p/itm|flipkart\.com/hyperlocal-preview-page"
+    )
+
+    for selector in (
+        "a[href*='/p/itm']",                 # canonical product anchor
+        "a[href*='hyperlocal-preview']",     # Minutes interstitial wrapper
+        "a[href*='/p/'][href*='pid=']",      # alternate Flipkart product URL shape
+    ):
+        link = page.locator(selector).first
+        try:
+            # state="attached" so below-the-fold links are still found; we
+            # scroll into view before clicking.
+            await link.wait_for(state="attached", timeout=4_000)
+        except PlaywrightTimeoutError:
+            continue
+        try:
+            await link.scroll_into_view_if_needed()
+            await link.click()
+            await page.wait_for_url(landed_pattern, timeout=15_000)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def visit_regular_product(page, order_detail_url: str) -> dict:
+    """For a regular (non-Minutes) order: navigate orders → order-detail → product page,
+    extract per-product fields, then return to the orders list. Always returns a
+    populated dict so callers can upsert with whatever we have."""
+    if not order_detail_url:
+        return _unavailable_fields()
+    try:
+        if not order_detail_url.startswith("http"):
+            order_detail_url = FLIPKART_HOME.rstrip("/") + "/" + order_detail_url.lstrip("/")
+        await page.goto(order_detail_url, wait_until="domcontentloaded")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8_000)
+        except PlaywrightTimeoutError:
+            pass
+        await page.wait_for_timeout(700)
+
+        if not await _click_into_product_from_current_page(page):
+            return _unavailable_fields()
+
+        return await extract_product_details(page)
+    except Exception as exc:
+        print(f"  [product] navigation failed: {exc}")
+        return _unavailable_fields()
+
+
+async def _return_to_basket_expanded(page, basket_url: str) -> None:
+    """After visiting a product page, get back to the Minutes basket detail
+    with the 'See all items' panel re-expanded. We try `go_back` first
+    (cheap, sometimes preserves state); if that lands somewhere else or
+    the expanded state is lost, fall back to a fresh `goto(basket_url)`
+    and re-click 'See all items'."""
+    try:
+        await page.go_back(wait_until="domcontentloaded", timeout=8_000)
+        await page.wait_for_timeout(600)
+    except Exception:
+        pass
+
+    if page.url != basket_url:
+        try:
+            await page.goto(basket_url, wait_until="domcontentloaded")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=6_000)
+            except PlaywrightTimeoutError:
+                pass
+            await page.wait_for_timeout(600)
+        except Exception as exc:
+            print(f"  [back] goto basket failed: {exc}")
+            return
+
+    # Re-trigger 'See all items' so subsequent tiles are clickable.
+    try:
+        see_all = page.get_by_text(re.compile(r"(see|view)\s+all\s+items", re.I)).first
+        await see_all.wait_for(state="visible", timeout=4_000)
+        await see_all.click()
+        await page.wait_for_timeout(1_200)
+    except PlaywrightTimeoutError:
+        # Already expanded (no link present) or items rendered inline — fine.
+        pass
+
+
+async def scrape_minutes_basket(
+    page, card, order_idx: int, total: int,
+    details_cache: dict[str, dict] | None = None,
+) -> list[dict]:
     """For a Flipkart Minutes Basket card: click into the detail page, expand
     'See all items', extract product titles + order date, then go back to the
-    orders list."""
+    orders list.
+
+    `details_cache` is a shared title→per-product-page-fields map. The same
+    grocery item often appears across multiple Minutes baskets (weekly milk,
+    curd, etc.) — caching the first successful page visit avoids re-clicking
+    every basket. The cache is mutated in place."""
+    cache: dict[str, dict] = details_cache if details_cache is not None else {}
     card_text = (await card.inner_text()) or ""
     fallback_date = _extract_date_from_text(card_text)
 
@@ -616,6 +1000,9 @@ async def scrape_minutes_basket(page, card, order_idx: int, total: int) -> list[
     except PlaywrightTimeoutError:
         print(f"[order {order_idx}/{total}] 'See all items' not visible — using visible items.")
 
+    # Remember the basket URL so we can return here between product-page clicks.
+    basket_url = page.url
+
     items = await page.evaluate(r"""
         () => {
           const imgs = Array.from(document.querySelectorAll(
@@ -624,10 +1011,18 @@ async def scrape_minutes_basket(page, card, order_idx: int, total: int) -> list[
           const out = [];
           for (const img of imgs) {
             let cur = img;
+            let href = null;
             for (let i = 0; i < 10 && cur; i++) {
+              // Capture the nearest ancestor anchor href, if any. Minutes
+              // tiles wrap their image+text in a single <a> pointing to the
+              // hyperlocal-preview-page URL (originalUrl param holds the
+              // canonical /p/itm... product URL).
+              if (!href && cur.tagName === 'A' && cur.href) {
+                href = cur.href;
+              }
               const t = (cur.innerText || '').replace(/\s+/g,' ').trim();
               if (t.length > 5 && t.length < 400 && t.includes('₹')) {
-                out.push({ text: t, src: img.src });
+                out.push({ text: t, src: img.src, href: href });
                 break;
               }
               cur = cur.parentElement;
@@ -637,23 +1032,152 @@ async def scrape_minutes_basket(page, card, order_idx: int, total: int) -> list[
         }
     """)
 
-    products: list[dict] = []
-    seen: set[str] = set()
+    # Deduplicate items within this basket. Capture price+href from the
+    # basket page itself — Minutes SKUs route through a hyperlocal-preview
+    # interstitial that redirects back to itself even after we follow
+    # originalUrl, so the product page is not a reliable source of price.
+    # The basket already shows the price next to every item.
+    unique_items: list[dict] = []
+    seen_titles: set[str] = set()
     for it in items:
         title = _clean_minutes_product_title(it["text"])
-        if not title or title.lower() in seen:
+        if not title or title.lower() in seen_titles:
             continue
-        seen.add(title.lower())
+        seen_titles.add(title.lower())
+        price_match = re.search(r"₹\s*([\d,]+(?:\.\d+)?)", it["text"])
+        try:
+            basket_price = float(price_match.group(1).replace(",", "")) if price_match else None
+        except (TypeError, ValueError):
+            basket_price = None
+        unique_items.append({
+            "title": title,
+            "basket_image": it.get("src"),
+            "basket_price": basket_price,
+            "basket_href": _unwrap_preview_url(it.get("href") or ""),
+        })
+
+    products: list[dict] = []
+    for item_idx, it in enumerate(unique_items):
+        title = it["title"]
+
+        # Cross-basket optimization: reuse details captured from any prior basket.
+        cached = cache.get(title)
+        if cached is not None:
+            print(f"  [cache] reusing details for {title[:50]}")
+            products.append({
+                "item_id": f"minutes::{order_idx}::{title.lower()}",
+                "title": title,
+                "date": order_date,
+                "category": "Grocery",
+                "order_detail_url": None,
+                **cached,
+            })
+            continue
+
+        # Defaults from the basket page text — used only when the tile click
+        # below cannot reach a real product page (captcha, preview gate that
+        # refuses to lift, network error). basket_price is the purchase price,
+        # NOT the current price; we'll overwrite it whenever the product page
+        # itself yields a value.
+        details = {
+            "current_price": it.get("basket_price"),
+            "product_url": it.get("basket_href") or None,
+            "image_url": it.get("basket_image"),
+            "availability": "Unavailable",
+        }
+
+        # Make sure we're on the basket detail with 'See all items' expanded
+        # before locating the next tile. After the first product visit the
+        # DOM has been replaced — we need a fresh basket render.
+        if item_idx > 0:
+            await _return_to_basket_expanded(page, basket_url)
+
+        # Resolve the tile to click. Prefer the anchor that wraps THE EXACT
+        # image we captured in JS (stable identifier); fall back to title text.
+        print(f"\n  [tile {item_idx + 1}/{len(unique_items)}] {title[:55]}")
+        tile = None
+        img_src = it.get("basket_image") or ""
+        if img_src:
+            escaped = img_src.replace('"', '\\"')
+            cand = page.locator(f'a:has(img[src="{escaped}"])').first
+            if await cand.count() > 0:
+                tile = cand
+                print(f"  [tile] resolved by image anchor")
+        if tile is None:
+            tile = page.get_by_text(title, exact=False).first
+            print(f"  [tile] resolved by text (fallback)")
+
+        try:
+            await tile.scroll_into_view_if_needed()
+            url_before = page.url
+            print(f"  [click] dispatching; url before = {url_before[:90]}")
+            await tile.click()
+
+            # Wait for the redirect chain to complete on /p/itm. If we never
+            # get there (Minutes preview gate, captcha, etc.), give the page
+            # a few more seconds and proceed with whatever URL we landed on.
+            try:
+                await page.wait_for_url(
+                    re.compile(r"flipkart\.com/[^?#]*?/p/itm"),
+                    timeout=15_000,
+                )
+            except PlaywrightTimeoutError:
+                await page.wait_for_timeout(3_000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8_000)
+            except PlaywrightTimeoutError:
+                pass
+            await page.wait_for_timeout(700)
+
+            landed = page.url
+            print(f"  [settle] landed: {landed[:90]}")
+
+            if landed == url_before:
+                print(f"  [warn] click did not navigate; keeping basket fallback")
+            else:
+                # extract_product_details also unwraps any lingering preview URL.
+                page_details = await extract_product_details(page)
+
+                px = page_details.get("current_price")
+                if px is not None:
+                    details["current_price"] = px
+                    print(f"  [price] ₹{px} (from product page)")
+                else:
+                    print(
+                        f"  [price] product page yielded no price; "
+                        f"keeping basket ₹{details['current_price']}"
+                    )
+                if page_details.get("image_url"):
+                    details["image_url"] = page_details["image_url"]
+                # product_url := wherever we actually ended up — the URL a
+                # user can click to reach the page we just scraped.
+                if page_details.get("product_url"):
+                    details["product_url"] = page_details["product_url"]
+                    print(f"  [url] {details['product_url'][:90]}")
+                details["availability"] = page_details.get("availability", "Unavailable")
+        except Exception as exc:
+            print(f"  [error] click for {title[:40]} failed: {exc}")
+
+        cache[title] = dict(details)
         products.append({
             "item_id": f"minutes::{order_idx}::{title.lower()}",
             "title": title,
             "date": order_date,
+            "category": "Grocery",
+            "order_detail_url": None,
+            **details,
         })
 
     print(f"[order {order_idx}/{total}] Minutes Basket: {len(products)} product(s)")
 
-    await page.go_back()
-    await page.wait_for_load_state("networkidle")
+    # Return to the orders list — prefer an explicit goto over go_back, which
+    # can land on an intermediate page after our per-item navigations.
+    try:
+        await page.goto(FLIPKART_ORDERS, wait_until="domcontentloaded")
+        await page.wait_for_load_state("networkidle")
+    except Exception:
+        await page.go_back()
+        await page.wait_for_load_state("networkidle")
     await page.wait_for_timeout(1_500)
 
     return products
@@ -678,7 +1202,13 @@ async def expand_and_get_products(page, card, order_idx: int, total: int) -> lis
         date = _extract_date_from_text(raw_text)
 
         if title:
-            products.append({"item_id": item_id, "title": title, "date": date})
+            products.append({
+                "item_id": item_id,
+                "title": title,
+                "date": date,
+                "category": "Non-Grocery",
+                "order_detail_url": href,
+            })
 
     # Refunded / cancelled sub-items have no date in their anchor text. Fall
     # back to any sibling's date in the same order card, then to the card text.
@@ -724,7 +1254,9 @@ async def run(num_orders: int, headless: bool) -> None:
 
         browser = await pw.chromium.launch(
             headless=headless,
-            slow_mo=400 if not headless else 0,
+            # In headed mode, slow down so you can watch each click. Headless
+            # stays at 0 for production speed.
+            slow_mo=900 if not headless else 0,
             args=browser_args,
         )
 
@@ -734,9 +1266,21 @@ async def run(num_orders: int, headless: bool) -> None:
         if storage_state:
             print(f"[auth] Restoring session from {AUTH_STATE_FILE}")
 
+        # Grant geolocation so Flipkart Minutes recognizes a known location
+        # and routes us through to the real product page instead of stranding
+        # us on the hyperlocal-preview interstitial. Override via env if your
+        # delivery area is elsewhere — defaults to Bengaluru.
+        try:
+            lat = float(os.getenv("FLIPKART_LAT") or 12.9716)
+            lng = float(os.getenv("FLIPKART_LNG") or 77.5946)
+        except ValueError:
+            lat, lng = 12.9716, 77.5946
+
         context = await browser.new_context(
             storage_state=storage_state,
             viewport={"width": 1400, "height": 900},
+            geolocation={"latitude": lat, "longitude": lng},
+            permissions=["geolocation"],
         )
         page = await context.new_page()
 
@@ -838,6 +1382,10 @@ async def run(num_orders: int, headless: bool) -> None:
         # away and back, which detaches any previously captured ElementHandles.
         all_products: list[dict] = []
         seen_item_ids_global: set[str] = set()
+        # Shared per-run cache: title → product-page fields. Populated by the
+        # first basket that successfully extracts a given product, reused by
+        # later baskets so repeat groceries aren't re-clicked.
+        minutes_details_cache: dict[str, dict] = {}
         for idx in range(1, actual_count + 1):
             try:
                 # Re-scroll after every Minutes back-navigation, which often
@@ -853,7 +1401,10 @@ async def run(num_orders: int, headless: bool) -> None:
                 card_text = (await card.inner_text()) or ""
 
                 if re.search(r"minutes\s*basket", card_text, re.I):
-                    products = await scrape_minutes_basket(page, card, idx, actual_count)
+                    products = await scrape_minutes_basket(
+                        page, card, idx, actual_count,
+                        details_cache=minutes_details_cache,
+                    )
                 else:
                     products = await expand_and_get_products(page, card, idx, actual_count)
 
@@ -865,20 +1416,69 @@ async def run(num_orders: int, headless: bool) -> None:
             except Exception as exc:
                 print(f"[order {idx}/{actual_count}] Error: {exc}")
 
+        # ---- Aggregate by title BEFORE closing the context ----
+        # Each unique title is visited once on its product page (regular orders
+        # only — Minutes products already populated their per-product fields
+        # inline during basket scraping).
+        title_counts: Counter[str] = Counter(p["title"] for p in all_products)
+
+        unique_by_title: dict[str, dict] = {}
+        for p in all_products:
+            t = p["title"]
+            cur = unique_by_title.get(t)
+            if cur is None:
+                unique_by_title[t] = dict(p)
+                continue
+            # Newer date wins.
+            if p.get("date") and p["date"] != "unknown" and (
+                not cur.get("date") or cur["date"] == "unknown" or p["date"] > cur["date"]
+            ):
+                cur["date"] = p["date"]
+            # If we don't yet have an order_detail_url, take this one.
+            if not cur.get("order_detail_url") and p.get("order_detail_url"):
+                cur["order_detail_url"] = p["order_detail_url"]
+            # Prefer already-populated per-product fields from Minutes runs.
+            for k in ("current_price", "product_url", "image_url"):
+                if not cur.get(k) and p.get(k):
+                    cur[k] = p[k]
+            if cur.get("availability") == "Unavailable" and p.get("availability") == "Available":
+                cur["availability"] = "Available"
+
+        # Per-product page visit for any title that still lacks page details
+        # (i.e. regular-order products — Minutes are already filled in).
+        regular_titles = [
+            t for t, p in unique_by_title.items()
+            if p.get("category") == "Non-Grocery" and p.get("product_url") is None
+        ]
+        print(f"\n[products] Visiting {len(regular_titles)} unique product page(s)…")
+        for i, title in enumerate(regular_titles, 1):
+            entry = unique_by_title[title]
+            print(f"  [{i}/{len(regular_titles)}] {title[:70]}")
+            details = await visit_regular_product(page, entry.get("order_detail_url"))
+            entry.update(details)
+
         await context.close()
 
-    # ---- Aggregate ----
-    title_counts = Counter(p["title"] for p in all_products)
-    report_products = [
-        {
-            "title": p["title"],
-            "purchase_date": p["date"],
-            "purchase_count_in_last_10_orders": title_counts[p["title"]],
-        }
-        for p in all_products
-    ]
+    # ---- Build report ----
+    scraped_at = datetime.now(tz=timezone.utc).astimezone().isoformat()
+    report_products = []
+    for title, p in unique_by_title.items():
+        date = p.get("date")
+        report_products.append({
+            "title": title,
+            "last_ordered_date": None if not date or date == "unknown" else date,
+            "number_of_times_purchased": title_counts[title],
+            "current_price": p.get("current_price"),
+            "product_url": p.get("product_url"),
+            "image_url": p.get("image_url"),
+            "category": p.get("category"),
+            "availability": p.get("availability") or "Unavailable",
+            "source": "Flipkart",
+            "scraped_at": scraped_at,
+        })
+
     report = {
-        "scraped_at": datetime.now(tz=timezone.utc).astimezone().isoformat(),
+        "scraped_at": scraped_at,
         "orders_scanned": actual_count,
         "products": report_products,
     }
@@ -888,11 +1488,19 @@ async def run(num_orders: int, headless: bool) -> None:
     )
     print(f"\n[done] Report written to {ORDERS_REPORT_FILE}")
 
-    print(f"\n{'#':<4}  {'Product Title':<60}  {'Date':<12}  {'Count'}")
-    print("-" * 90)
+    print(
+        f"\n{'#':<4}  {'Product Title':<50}  {'Date':<12}  {'Cnt':<4}  "
+        f"{'Price':<8}  {'Cat':<12}  {'Avail'}"
+    )
+    print("-" * 110)
     for i, p in enumerate(report_products, 1):
-        title = p["title"][:58] + ".." if len(p["title"]) > 60 else p["title"]
-        print(f"{i:<4}  {title:<60}  {p['purchase_date']:<12}  {p['purchase_count_in_last_10_orders']}")
+        title = p["title"][:48] + ".." if len(p["title"]) > 50 else p["title"]
+        price = "" if p["current_price"] is None else f"₹{p['current_price']}"
+        print(
+            f"{i:<4}  {title:<50}  {str(p['last_ordered_date']):<12}  "
+            f"{p['number_of_times_purchased']:<4}  {price:<8}  "
+            f"{str(p['category']):<12}  {p['availability']}"
+        )
 
     # ---- Push to Salesforce ----
     # Best-effort: any failure here is logged but does not fail the scrape.
@@ -904,8 +1512,14 @@ async def run(num_orders: int, headless: bool) -> None:
 
 
 def main() -> None:
+    default_orders = default_orders_to_scrape()
     ap = argparse.ArgumentParser(description="Scrape Flipkart order history.")
-    ap.add_argument("--orders", type=int, default=10, help="Number of orders to scrape (default: 10)")
+    ap.add_argument(
+        "--orders",
+        type=int,
+        default=default_orders,
+        help=f"Number of orders to scrape (default: {default_orders}, from ORDERS_TO_SCRAPE in .env)",
+    )
     ap.add_argument(
         "--headed",
         type=lambda v: v.lower() not in ("false", "0", "no"),

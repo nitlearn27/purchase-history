@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/test_runner_hook.py",
+            "timeout": 150,
+            "statusMessage": "Running test_units.py after change…"
+          }
+        ]
+      }
+    ]
+  }
+}

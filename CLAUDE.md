@@ -85,6 +85,7 @@ for local development and cloud deployment on **Render** (Docker-based).
 | `GMAIL_TOKEN_FILE` | `token.json` |
 | `HEADLESS` | `false` locally, `true` in Docker |
 | `PORT` | `10000` (Render sets this automatically) |
+| `ORDERS_TO_SCRAPE` | `10` — fallback for both `scrape_flipkart_orders.py` (when `--orders` is omitted) and `POST /api/products` (when the request body omits `"orders"`). Explicit values still override. |
 
 ## Environment Setup (Local)
 

@@ -1204,6 +1204,7 @@ async def scrape_minutes_basket(
         # itself yields a value.
         details = {
             "current_price": it.get("basket_price"),
+            "last_purchased_price": it.get("basket_price"),
             "product_url": it.get("basket_href") or None,
             "image_url": it.get("basket_image"),
             "availability": "Unavailable",
@@ -1324,6 +1325,12 @@ async def expand_and_get_products(page, card, order_idx: int, total: int) -> lis
         title = _clean_product_title(raw_text)
         date = _extract_date_from_text(raw_text)
 
+        price_match = re.search(r"₹\s*([\d,]+(?:\.\d+)?)", raw_text)
+        try:
+            last_purchased_price = float(price_match.group(1).replace(",", "")) if price_match else None
+        except (TypeError, ValueError):
+            last_purchased_price = None
+
         if title:
             products.append({
                 "item_id": item_id,
@@ -1331,6 +1338,7 @@ async def expand_and_get_products(page, card, order_idx: int, total: int) -> lis
                 "date": date,
                 "category": "Non-Grocery",
                 "order_detail_url": href,
+                "last_purchased_price": last_purchased_price,
             })
 
     # Refunded / cancelled sub-items have no date in their anchor text. Fall
@@ -1557,11 +1565,13 @@ async def run(num_orders: int, headless: bool) -> None:
                 not cur.get("date") or cur["date"] == "unknown" or p["date"] > cur["date"]
             ):
                 cur["date"] = p["date"]
+                if "last_purchased_price" in p:
+                    cur["last_purchased_price"] = p["last_purchased_price"]
             # If we don't yet have an order_detail_url, take this one.
             if not cur.get("order_detail_url") and p.get("order_detail_url"):
                 cur["order_detail_url"] = p["order_detail_url"]
             # Prefer already-populated per-product fields from Minutes runs.
-            for k in ("current_price", "product_url", "image_url"):
+            for k in ("current_price", "last_purchased_price", "product_url", "image_url"):
                 if not cur.get(k) and p.get(k):
                     cur[k] = p[k]
             if cur.get("availability") == "Unavailable" and p.get("availability") == "Available":
@@ -1592,6 +1602,7 @@ async def run(num_orders: int, headless: bool) -> None:
             "last_ordered_date": None if not date or date == "unknown" else date,
             "number_of_times_purchased": title_counts[title],
             "current_price": p.get("current_price"),
+            "last_purchased_price": p.get("last_purchased_price"),
             "product_url": p.get("product_url"),
             "image_url": p.get("image_url"),
             "category": p.get("category"),

@@ -51,6 +51,7 @@ class BuildPayloadTests(unittest.TestCase):
             "last_ordered_date": "2026-05-22",
             "number_of_times_purchased": 3,
             "current_price": 27.0,
+            "last_purchased_price": 26.0,
             "product_url": "https://www.flipkart.com/x/p/itm123",
             "image_url": "https://rukminim2.flixcart.com/abc.jpg",
             "category": "Grocery",
@@ -66,6 +67,7 @@ class BuildPayloadTests(unittest.TestCase):
         self.assertEqual(payload[sf.COUNT_FIELD], 3)
         self.assertEqual(payload[sf.DATE_FIELD], "2026-05-22")
         self.assertEqual(payload[sf.PRICE_FIELD], 27.0)
+        self.assertEqual(payload[sf.LAST_PURCHASED_PRICE_FIELD], 26.0)
         self.assertEqual(payload[sf.URL_FIELD], "https://www.flipkart.com/x/p/itm123")
         self.assertEqual(payload[sf.IMAGE_FIELD], "https://rukminim2.flixcart.com/abc.jpg")
         self.assertEqual(payload[sf.CATEGORY_FIELD], "Grocery")
@@ -367,6 +369,7 @@ class ReportShapeTests(unittest.TestCase):
             "last_ordered_date": "2026-05-22",
             "number_of_times_purchased": 2,
             "current_price": 99.0,
+            "last_purchased_price": 95.0,
             "product_url": "https://www.flipkart.com/x/p/itm456",
             "image_url": "https://rukminim2.flixcart.com/x.jpg",
             "category": "Non-Grocery",
@@ -377,8 +380,8 @@ class ReportShapeTests(unittest.TestCase):
         # Salesforce payload from a full row must contain every __c field.
         payload = sf._build_payload(row)
         expected = {
-            sf.COUNT_FIELD, sf.DATE_FIELD, sf.PRICE_FIELD, sf.URL_FIELD,
-            sf.IMAGE_FIELD, sf.CATEGORY_FIELD, sf.AVAILABILITY_FIELD,
+            sf.COUNT_FIELD, sf.DATE_FIELD, sf.PRICE_FIELD, sf.LAST_PURCHASED_PRICE_FIELD,
+            sf.URL_FIELD, sf.IMAGE_FIELD, sf.CATEGORY_FIELD, sf.AVAILABILITY_FIELD,
             sf.SOURCE_FIELD, sf.SCRAPED_AT_FIELD,
         }
         self.assertEqual(set(payload.keys()), expected)

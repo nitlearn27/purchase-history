@@ -38,6 +38,7 @@ os.environ.setdefault(
 
 import salesforce_sync as sf
 import scrape_flipkart_orders as sfo
+import flipkart_minutes_cart as fmc
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +386,64 @@ class ReportShapeTests(unittest.TestCase):
             sf.SOURCE_FIELD, sf.SCRAPED_AT_FIELD,
         }
         self.assertEqual(set(payload.keys()), expected)
+
+
+# ---------------------------------------------------------------------------
+# flipkart_minutes_cart.best_match — fuzzy matching (pure)
+# ---------------------------------------------------------------------------
+
+class BestMatchTests(unittest.TestCase):
+    def test_exact_match_wins(self):
+        cands = ["Aashirvaad Atta 5kg", "Amul Gold Milk 500 ml", "Tata Salt 1kg"]
+        result = fmc.best_match("Amul Gold Milk", cands, threshold=60)
+        self.assertIsNotNone(result)
+        idx, score = result
+        self.assertEqual(cands[idx], "Amul Gold Milk 500 ml")
+        self.assertGreaterEqual(score, 60)
+
+    def test_word_reorder_and_brand_noise_match(self):
+        # token_set_ratio should match despite reordering + extra size/brand words.
+        cands = ["Aashirvaad Shudh Chakki Atta Whole Wheat 5 kg", "Maggi Noodles"]
+        result = fmc.best_match("atta aashirvaad", cands, threshold=60)
+        self.assertIsNotNone(result)
+        idx, _ = result
+        self.assertEqual(idx, 0)
+
+    def test_below_threshold_returns_none(self):
+        cands = ["Tata Salt 1kg", "Maggi Noodles 70g"]
+        self.assertIsNone(fmc.best_match("Sony Bluetooth Headphones", cands, threshold=80))
+
+    def test_empty_candidates_returns_none(self):
+        self.assertIsNone(fmc.best_match("Anything", [], threshold=60))
+
+    def test_empty_query_returns_none(self):
+        self.assertIsNone(fmc.best_match("   ", ["Amul Milk"], threshold=60))
+
+    def test_threshold_from_env(self):
+        # With no explicit threshold, best_match reads CART_MATCH_THRESHOLD.
+        # Use a partial-match pair and straddle its real score so the test is
+        # robust to rapidfuzz scoring details.
+        from rapidfuzz import fuzz, utils
+        query, cand = "Amul Butter 100g", "Amul Gold Toned Milk 1 L"
+        score = fuzz.token_set_ratio(query, cand, processor=utils.default_process)
+        with mock.patch.dict(os.environ, {"CART_MATCH_THRESHOLD": str(score + 5)}):
+            self.assertIsNone(fmc.best_match(query, [cand]))
+        with mock.patch.dict(os.environ, {"CART_MATCH_THRESHOLD": str(score - 5)}):
+            self.assertIsNotNone(fmc.best_match(query, [cand]))
+
+
+class MatchThresholdTests(unittest.TestCase):
+    def test_default_when_unset(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(fmc.match_threshold(), fmc.DEFAULT_MATCH_THRESHOLD)
+
+    def test_invalid_falls_back_to_default(self):
+        with mock.patch.dict(os.environ, {"CART_MATCH_THRESHOLD": "abc"}):
+            self.assertEqual(fmc.match_threshold(), fmc.DEFAULT_MATCH_THRESHOLD)
+
+    def test_valid_value_is_used(self):
+        with mock.patch.dict(os.environ, {"CART_MATCH_THRESHOLD": "75"}):
+            self.assertEqual(fmc.match_threshold(), 75.0)
 
 
 if __name__ == "__main__":

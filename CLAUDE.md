@@ -48,6 +48,7 @@ for local development and cloud deployment on **Render** (Docker-based).
 ├── requirements.txt
 ├── app.py                   # Flask web service (entry point) + Swagger UI at /docs
 ├── scrape_flipkart_orders.py  # Core scraping logic; calls salesforce_sync at end
+├── flipkart_minutes_cart.py # Fuzzy-match product names → add to Flipkart Minutes cart
 ├── salesforce_sync.py       # OAuth + PATCH Grocery_Product__c.title__c matches
 └── test_gmail_auth.py       # Standalone Gmail API auth test
 ```
@@ -85,6 +86,7 @@ for local development and cloud deployment on **Render** (Docker-based).
 | `GMAIL_TOKEN_FILE` | `token.json` |
 | `HEADLESS` | `false` locally, `true` in Docker |
 | `PORT` | `10000` (Render sets this automatically) |
+| `CART_MATCH_THRESHOLD` | `60` — min fuzzy score (0–100) for `POST /api/cart` to accept a Minutes search result as a match |
 | `ORDERS_TO_SCRAPE` | `10` — fallback for both `scrape_flipkart_orders.py` (when `--orders` is omitted) and `POST /api/products` (when the request body omits `"orders"`). Explicit values still override. |
 
 ## Environment Setup (Local)
@@ -131,6 +133,8 @@ $env:PORT="3000"; $env:HEADLESS="false"; .venv\Scripts\python.exe app.py
 | `GET` | `/openapi.json` | OpenAPI 3.0 spec |
 | `GET` | `/api/products` | Latest scrape output, `{product_name, date, number_of_times_purchased}` shape |
 | `POST` | `/api/products` | Start a scrape (runs in background thread). Body: `{"orders": <int>}`, default 10 |
+| `GET` | `/api/cart` | Result of the last add-to-cart run, per-product `{input, matched_title, score, status}` |
+| `POST` | `/api/cart` | Fuzzy-match names → add best match to Flipkart Minutes cart (background thread, no checkout). Body: `{"products": ["name", ...]}` |
 
 Open `http://localhost:3000/docs` for the interactive playground (the `/` route
 redirects there). From there, every endpoint can be exercised with the
@@ -151,6 +155,15 @@ Invoke-RestMethod http://localhost:3000/api/products
 .venv\Scripts\python.exe scrape_flipkart_orders.py           # headed, 10 orders
 .venv\Scripts\python.exe scrape_flipkart_orders.py --orders=5
 .venv\Scripts\python.exe scrape_flipkart_orders.py --headed=false  # headless
+```
+
+### Add products to the Flipkart Minutes cart (without Flask)
+
+```powershell
+# Fuzzy-match each name against Minutes search results, add the best match.
+# Stops at the cart — never checks out. Tune matching with CART_MATCH_THRESHOLD.
+.venv\Scripts\python.exe flipkart_minutes_cart.py "Amul Gold Milk" "Aashirvaad Atta 5kg"
+.venv\Scripts\python.exe flipkart_minutes_cart.py "Tata Salt" --headed=false
 ```
 
 ### Test Gmail API auth
@@ -297,7 +310,10 @@ Container starts
 
 ## Out of Scope
 
-- No purchase, cancel, return, or any write action on the Flipkart account.
+- **Add-to-cart is the only permitted write action** on the Flipkart account
+  (via `flipkart_minutes_cart.py` / `POST /api/cart`). It stops at adding items
+  to the Minutes cart — never checkout, payment, placing an order, cancel, or
+  return.
 - No scraping beyond the 10 most recent orders unless `--orders` is explicitly raised.
 - No creation of new Salesforce records — sync only updates titles that already exist.
 - No multi-user support — the service is single-tenant (one Flipkart account).

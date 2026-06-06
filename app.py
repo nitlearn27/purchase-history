@@ -86,6 +86,15 @@ _state = {
     "error": None,
 }
 
+# Separate state for the Minutes "add to cart" feature.
+_cart_lock = threading.Lock()
+_cart_state = {
+    "running": False,
+    "last_result": None,          # dict from add_products_to_cart()
+    "last_run_at": None,          # ISO timestamp
+    "error": None,
+}
+
 
 def _run_scrape(num_orders: int) -> None:
     """Blocking function executed in a background thread."""
@@ -116,6 +125,24 @@ def _run_scrape(num_orders: int) -> None:
     finally:
         _state["running"] = False
         _state["last_run_at"] = datetime.now(tz=timezone.utc).isoformat()
+
+
+def _run_cart(product_names: list[str]) -> None:
+    """Blocking function executed in a background thread: fuzzy-match each name
+    against Flipkart Minutes search results and add the best match to the cart."""
+    global _cart_state
+    headless = os.getenv("HEADLESS", "true").lower() in ("true", "1", "yes")
+    try:
+        from flipkart_minutes_cart import add_products_to_cart
+        result = asyncio.run(add_products_to_cart(product_names, headless=headless))
+        _cart_state["last_result"] = result
+        _cart_state["error"] = None
+    except Exception as exc:
+        _cart_state["error"] = str(exc)
+        print(f"[cart] Error: {exc}")
+    finally:
+        _cart_state["running"] = False
+        _cart_state["last_run_at"] = datetime.now(tz=timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +259,87 @@ def api_refresh_products():
     }), 202
 
 
+@app.route("/api/cart", methods=["POST"])
+def api_add_to_cart():
+    """
+    Fuzzy-match an array of product names against Flipkart Minutes search results
+    and add the best match for each to the cart (no checkout).
+
+    JSON body: { "products": ["Amul Gold Milk", "Aashirvaad Atta 5kg"] }
+
+    Returns immediately with status 202.
+    Poll GET /api/cart until status switches from "running" to having results.
+    """
+    body = request.get_json(silent=True) or {}
+    products = body.get("products")
+    if not isinstance(products, list) or not any(
+        isinstance(p, str) and p.strip() for p in products
+    ):
+        return jsonify({
+            "status": "error",
+            "message": "Body must be {\"products\": [<non-empty product name>, ...]}.",
+        }), 400
+
+    names = [p.strip() for p in products if isinstance(p, str) and p.strip()]
+
+    with _cart_lock:
+        if _cart_state["running"]:
+            return jsonify({
+                "status": "running",
+                "message": "A cart operation is already in progress.",
+            }), 409
+        _cart_state["running"] = True
+        _cart_state["error"] = None
+
+    thread = threading.Thread(target=_run_cart, args=(names,), daemon=True)
+    thread.start()
+
+    return jsonify({
+        "status": "started",
+        "products_requested": len(names),
+        "message": "Add-to-cart started. Poll GET /api/cart until results appear.",
+    }), 202
+
+
+@app.route("/api/cart", methods=["GET"])
+def api_get_cart():
+    """
+    Returns the result of the last add-to-cart operation.
+
+    Response (200) with per-product {input, matched_title, score, status}.
+    Response (202) if an add-to-cart is currently running.
+    Response (404) if none has been run yet.
+    Response (500) if the last operation errored.
+    """
+    if _cart_state["running"]:
+        return jsonify({
+            "status": "running",
+            "message": "An add-to-cart is in progress. Try again shortly.",
+        }), 202
+
+    if _cart_state["error"]:
+        return jsonify({
+            "status": "error",
+            "error": _cart_state["error"],
+            "last_run_at": _cart_state["last_run_at"],
+        }), 500
+
+    if _cart_state["last_result"] is None:
+        return jsonify({
+            "status": "no_data",
+            "message": "No add-to-cart has been run yet. POST /api/cart to start one.",
+        }), 404
+
+    result = _cart_state["last_result"]
+    return jsonify({
+        "status": "ok",
+        "last_run_at": _cart_state["last_run_at"],
+        "requested": result.get("requested", 0),
+        "added": result.get("added", 0),
+        "results": result.get("results", []),
+    }), 200
+
+
 # ---------------------------------------------------------------------------
 # OpenAPI 3.0 spec + Swagger UI served at /docs
 # ---------------------------------------------------------------------------
@@ -256,6 +364,7 @@ _OPENAPI_SPEC = {
         {"name": "system",   "description": "Health and liveness."},
         {"name": "scrape",   "description": "Trigger Flipkart scrapes."},
         {"name": "products", "description": "Read the latest scrape output."},
+        {"name": "cart",     "description": "Add products to the Flipkart Minutes cart (no checkout)."},
     ],
     "paths": {
         "/health": {
@@ -333,6 +442,78 @@ _OPENAPI_SPEC = {
                     },
                     "409": {
                         "description": "A scrape is already running.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"},
+                        }},
+                    },
+                },
+            },
+        },
+        "/api/cart": {
+            "get": {
+                "tags": ["cart"],
+                "summary": "Get the result of the last add-to-cart run",
+                "description": (
+                    "Returns per-product `{input, matched_title, score, status}` where "
+                    "`status` is `added`, `no_match`, or `error`."
+                ),
+                "responses": {
+                    "200": {
+                        "description": "Add-to-cart results available.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/CartOk"},
+                        }},
+                    },
+                    "202": {
+                        "description": "An add-to-cart is currently running.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Running"},
+                        }},
+                    },
+                    "404": {
+                        "description": "No add-to-cart has been run yet.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"},
+                        }},
+                    },
+                    "500": {
+                        "description": "The last add-to-cart errored.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/ScrapeError"},
+                        }},
+                    },
+                },
+            },
+            "post": {
+                "tags": ["cart"],
+                "summary": "Add products to the Minutes cart",
+                "description": (
+                    "Fuzzy-matches each name against Flipkart Minutes search results and "
+                    "adds the best match to the cart. Never checks out. Returns `202 started` "
+                    "immediately; poll `GET /api/cart` for results."
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {"application/json": {
+                        "schema": {"$ref": "#/components/schemas/CartRequest"},
+                        "example": {"products": ["Amul Gold Milk", "Aashirvaad Atta 5kg"]},
+                    }},
+                },
+                "responses": {
+                    "202": {
+                        "description": "Add-to-cart started.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/CartStarted"},
+                        }},
+                    },
+                    "400": {
+                        "description": "Invalid request body.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"},
+                        }},
+                    },
+                    "409": {
+                        "description": "An add-to-cart is already running.",
                         "content": {"application/json": {
                             "schema": {"$ref": "#/components/schemas/Error"},
                         }},
@@ -418,6 +599,50 @@ _OPENAPI_SPEC = {
                     "availability":              {"type": "string", "nullable": True, "example": "Available"},
                     "source":                    {"type": "string", "nullable": True, "example": "Flipkart"},
                     "scraped_at":                {"type": "string", "format": "date-time", "nullable": True},
+                },
+            },
+            "CartRequest": {
+                "type": "object",
+                "required": ["products"],
+                "properties": {
+                    "products": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string"},
+                        "description": "Free-text product names to fuzzy-match and add to the Minutes cart.",
+                        "example": ["Amul Gold Milk", "Aashirvaad Atta 5kg"],
+                    },
+                },
+            },
+            "CartStarted": {
+                "type": "object",
+                "properties": {
+                    "status":             {"type": "string", "example": "started"},
+                    "products_requested": {"type": "integer", "example": 2},
+                    "message":            {"type": "string"},
+                },
+            },
+            "CartResult": {
+                "type": "object",
+                "properties": {
+                    "input":         {"type": "string", "example": "Amul Gold Milk"},
+                    "matched_title": {"type": "string", "nullable": True, "example": "Amul Gold Full Cream Milk 500 ml"},
+                    "score":         {"type": "number", "nullable": True, "example": 90.0},
+                    "status":        {"type": "string", "enum": ["added", "no_match", "error"], "example": "added"},
+                    "error":         {"type": "string", "nullable": True},
+                },
+            },
+            "CartOk": {
+                "type": "object",
+                "properties": {
+                    "status":      {"type": "string", "example": "ok"},
+                    "last_run_at": {"type": "string", "format": "date-time"},
+                    "requested":   {"type": "integer", "example": 2},
+                    "added":       {"type": "integer", "example": 2},
+                    "results": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/CartResult"},
+                    },
                 },
             },
         }

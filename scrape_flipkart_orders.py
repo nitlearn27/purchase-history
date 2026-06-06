@@ -72,6 +72,17 @@ SELECTORS = {
     # TODO: replace hashed class if Flipkart changes it
     "product_price": "div.Nx9bqj, div._30jeq3, div[class*='price']",
     "product_image": "img[src*='rukmini'], img[src*='flixcart']",
+    # ---- Flipkart Minutes "add to cart" feature (see flipkart_minutes_cart.py) ----
+    # Minutes results are React-Native-Web rendered (hashed css-* classes, no
+    # stable ids). Verified shape: each search result is an `a[href*="/p/itm"]`
+    # whose visible text is the product title and whose href is the product page.
+    # Search is reached by URL (…/search?q=<q>&marketplace=HYPERLOCAL); see
+    # MINUTES_SEARCH_URL. We add from each product's DETAIL page, because the
+    # in-grid "Add" buttons sit inside horizontal carousels whose RN-web scroll
+    # views swallow the click — the detail-page button is reliable.
+    "minutes_product_anchor": "a[href*='/p/itm']",
+    # The detail-page "Add to Cart" control (a <div>, matched on its own text).
+    "detail_add_to_cart_text": r"^(add to cart|add item)$",
 }
 
 # ---------------------------------------------------------------------------
@@ -1359,6 +1370,61 @@ async def expand_and_get_products(page, card, order_idx: int, total: int) -> lis
 # Main
 # ---------------------------------------------------------------------------
 
+async def launch_logged_in_context(pw, headless: bool, flipkart_email: str, gmail_service):
+    """Launch Chromium, build a geolocated context (restoring auth_state.json if
+    present), open a page, log in via OTP, and persist the refreshed session.
+
+    Returns (browser, context, page). Shared by the order scraper (`run`) and the
+    Minutes cart feature so both use one auth/browser path."""
+    # Browser args: --no-sandbox / --disable-dev-shm-usage are required when
+    # Chromium runs as root inside a Docker container (e.g. on Render).
+    browser_args = []
+    if headless:
+        browser_args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ]
+
+    browser = await pw.chromium.launch(
+        headless=headless,
+        # In headed mode, slow down so you can watch each click. Headless
+        # stays at 0 for production speed.
+        slow_mo=900 if not headless else 0,
+        args=browser_args,
+    )
+
+    # Reuse the saved Flipkart session if auth_state.json exists.
+    # On Render, this file is written from FLIPKART_AUTH_STATE env var at startup.
+    storage_state = str(AUTH_STATE_FILE) if AUTH_STATE_FILE.exists() else None
+    if storage_state:
+        print(f"[auth] Restoring session from {AUTH_STATE_FILE}")
+
+    # Grant geolocation so Flipkart Minutes recognizes a known location
+    # and routes us through to the real product page instead of stranding
+    # us on the hyperlocal-preview interstitial. Override via env if your
+    # delivery area is elsewhere — defaults to Bengaluru.
+    try:
+        lat = float(os.getenv("FLIPKART_LAT") or 12.9716)
+        lng = float(os.getenv("FLIPKART_LNG") or 77.5946)
+    except ValueError:
+        lat, lng = 12.9716, 77.5946
+
+    context = await browser.new_context(
+        storage_state=storage_state,
+        viewport={"width": 1400, "height": 900},
+        geolocation={"latitude": lat, "longitude": lng},
+        permissions=["geolocation"],
+    )
+    page = await context.new_page()
+
+    # ---- Login ----
+    await login(page, flipkart_email, gmail_service)
+    await save_auth(context)
+
+    return browser, context, page
+
+
 async def run(num_orders: int, headless: bool) -> None:
     load_dotenv()
     flipkart_email = os.getenv("FLIPKART_USERNAME", "")
@@ -1373,51 +1439,9 @@ async def run(num_orders: int, headless: bool) -> None:
     print("[gmail] Gmail API ready.")
 
     async with async_playwright() as pw:
-        # Browser args: --no-sandbox / --disable-dev-shm-usage are required when
-        # Chromium runs as root inside a Docker container (e.g. on Render).
-        browser_args = []
-        if headless:
-            browser_args = [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ]
-
-        browser = await pw.chromium.launch(
-            headless=headless,
-            # In headed mode, slow down so you can watch each click. Headless
-            # stays at 0 for production speed.
-            slow_mo=900 if not headless else 0,
-            args=browser_args,
+        browser, context, page = await launch_logged_in_context(
+            pw, headless, flipkart_email, gmail_service
         )
-
-        # Reuse the saved Flipkart session if auth_state.json exists.
-        # On Render, this file is written from FLIPKART_AUTH_STATE env var at startup.
-        storage_state = str(AUTH_STATE_FILE) if AUTH_STATE_FILE.exists() else None
-        if storage_state:
-            print(f"[auth] Restoring session from {AUTH_STATE_FILE}")
-
-        # Grant geolocation so Flipkart Minutes recognizes a known location
-        # and routes us through to the real product page instead of stranding
-        # us on the hyperlocal-preview interstitial. Override via env if your
-        # delivery area is elsewhere — defaults to Bengaluru.
-        try:
-            lat = float(os.getenv("FLIPKART_LAT") or 12.9716)
-            lng = float(os.getenv("FLIPKART_LNG") or 77.5946)
-        except ValueError:
-            lat, lng = 12.9716, 77.5946
-
-        context = await browser.new_context(
-            storage_state=storage_state,
-            viewport={"width": 1400, "height": 900},
-            geolocation={"latitude": lat, "longitude": lng},
-            permissions=["geolocation"],
-        )
-        page = await context.new_page()
-
-        # ---- Login ----
-        await login(page, flipkart_email, gmail_service)
-        await save_auth(context)
 
         # ---- Navigate to orders ----
         print("[nav] Navigating to orders page…")

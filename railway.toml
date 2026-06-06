@@ -1,0 +1,21 @@
+# Railway config-as-code. Railway builds the Dockerfile (Python 3.11 +
+# Playwright Chromium) and runs `python app.py`, which binds to $PORT (Railway
+# injects PORT at runtime; app.py reads it).
+#
+# Set these in the Railway dashboard → service → Variables (same set as render.yaml):
+#   FLIPKART_USERNAME, GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET,
+#   GMAIL_TOKEN_JSON, FLIPKART_AUTH_STATE,
+#   (optional) SF_TOKEN_URL, SF_CLIENT_ID, SF_CLIENT_SECRET, SF_API_ENDPOINT,
+#   (optional) CART_MATCH_THRESHOLD, FLIPKART_LAT, FLIPKART_LNG,
+#             FLIPKART_SAVED_ADDRESS_PREFIX, FLIPKART_PINCODE, ORDERS_TO_SCRAPE
+# HEADLESS is already forced to "true" inside the Dockerfile.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3

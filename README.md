@@ -23,9 +23,26 @@ records.
 | `GET`  | `/openapi.json`  | OpenAPI 3.0 spec.                                                           |
 | `GET`  | `/api/products`  | Latest scrape output: `{product_name, date, number_of_times_purchased}[]`.  |
 | `POST` | `/api/products`  | Start a scrape in a background thread. Body: `{"orders": <int>}` (default 10). |
+| `GET`  | `/api/cart`      | Result of the last add-to-cart run: `{input, matched_title, score, status}[]`. |
+| `POST` | `/api/cart`      | Fuzzy-match names → add best match to the Flipkart Minutes cart (background thread, **no checkout**). Body: `{"products": ["name", ...]}`. |
 
 A scrape takes 2–5 minutes. Poll `GET /api/products` until `status` flips from
 `running` to results.
+
+### Add to Minutes cart
+
+Send an array of free-text product names; each is fuzzy-matched against Flipkart
+Minutes search results and the best match (≥ `CART_MATCH_THRESHOLD`, default 60)
+is added to the cart. It never checks out — review and buy manually.
+
+```powershell
+# Start
+Invoke-RestMethod -Method POST -Uri http://localhost:3000/api/cart `
+  -ContentType "application/json" -Body '{"products": ["Amul Gold Milk", "Aashirvaad Atta 5kg"]}'
+
+# Poll for per-product results
+Invoke-RestMethod http://localhost:3000/api/cart
+```
 
 ---
 
@@ -100,6 +117,13 @@ Invoke-RestMethod http://localhost:3000/api/products
 .venv\Scripts\python.exe scrape_flipkart_orders.py --headed=false
 ```
 
+### Add to the Minutes cart directly (no Flask)
+
+```powershell
+.venv\Scripts\python.exe flipkart_minutes_cart.py "Amul Gold Milk" "Aashirvaad Atta 5kg"
+.venv\Scripts\python.exe flipkart_minutes_cart.py "Tata Salt" --headed=false
+```
+
 ### Re-sync the existing report to Salesforce (no re-scrape)
 
 ```powershell
@@ -148,6 +172,28 @@ Render's filesystem is ephemeral — `token.json` and `auth_state.json` are wipe
 on every restart. `app.py` rehydrates them from `GMAIL_TOKEN_JSON` and
 `FLIPKART_AUTH_STATE` on container startup, so the scraper finds them
 exactly where it expects.
+
+---
+
+## Deploying to Railway
+
+The same Docker image runs on Railway. `railway.toml` tells Railway to build the
+`Dockerfile` and health-check `/health`; `app.py` binds to the `PORT` Railway
+injects at runtime.
+
+1. **Complete Gmail OAuth locally** (`python test_gmail_auth.py`) to get a valid
+   `token.json`, then push to GitHub.
+2. **Railway → New Project → Deploy from GitHub repo.** Railway picks up
+   `railway.toml` / `Dockerfile` automatically.
+3. **Add the same environment variables** as the Render table above
+   (Service → Variables): `FLIPKART_USERNAME`, `GMAIL_CLIENT_ID`,
+   `GMAIL_CLIENT_SECRET`, `GMAIL_TOKEN_JSON`, optional `SF_*`, and the optional
+   tuning vars (`CART_MATCH_THRESHOLD`, `FLIPKART_LAT/LNG`,
+   `FLIPKART_SAVED_ADDRESS_PREFIX`, `FLIPKART_PINCODE`). `HEADLESS` is already
+   `true` in the Dockerfile; `PORT` is provided by Railway.
+4. **Deploy**, then trigger one scrape via `POST /api/products` and copy the
+   logged `auth_state.json` into the `FLIPKART_AUTH_STATE` variable so future
+   restarts skip the OTP login (Railway's filesystem is ephemeral too).
 
 ---
 

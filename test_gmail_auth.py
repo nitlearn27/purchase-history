@@ -8,20 +8,17 @@ Run this before the main scraper to confirm everything is wired up correctly.
 
 import argparse
 import os
+import re
 import sys
-from pathlib import Path
 
 from dotenv import load_dotenv
 
 # Reuse helpers from the main script
 from scrape_flipkart_orders import (
-    GMAIL_SCOPES,
     GMAIL_TOKEN_FILE,
     get_gmail_service,
     _decode_gmail_body,
 )
-
-import re
 
 
 def test_credentials_present() -> bool:

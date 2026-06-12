@@ -98,7 +98,6 @@ _cart_state = {
 
 def _run_scrape(num_orders: int) -> None:
     """Blocking function executed in a background thread."""
-    global _state
     headless = os.getenv("HEADLESS", "true").lower() in ("true", "1", "yes")
     try:
         from scrape_flipkart_orders import run
@@ -130,7 +129,6 @@ def _run_scrape(num_orders: int) -> None:
 def _run_cart(product_names: list[str]) -> None:
     """Blocking function executed in a background thread: fuzzy-match each name
     against Flipkart Minutes search results and add the best match to the cart."""
-    global _cart_state
     headless = os.getenv("HEADLESS", "true").lower() in ("true", "1", "yes")
     try:
         from flipkart_minutes_cart import add_products_to_cart

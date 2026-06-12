@@ -54,24 +54,16 @@ SELECTORS = {
         "button:has-text('Verify'), button:has-text('Submit'), "
         "button:has-text('Confirm'), button[type='submit']"
     ),
-    "logged_in_indicator": (
-        "a:has-text('My Account'), span:has-text('Account'), "
-        "[class*='account'][href*='wishlist'], [class*='profileIcon']"
-    ),
     # Flipkart: orders page — outer wrapper used by BOTH regular orders and
     # Flipkart Minutes Basket cards. Regular orders contain /order_details
     # anchors directly; Minutes Basket cards have no anchors and must be
     # clicked to open their detail page (URL includes &grocery=true).
     # TODO: replace hashed class if Flipkart changes it
     "order_card": "div.ZcgLRi",
-    # Product-page link on an order_details page — `/p/itm…` is Flipkart's
-    # canonical product URL shape.
-    "product_link_on_order_detail": "a[href*='/p/itm']",
     # On the product page itself — prefer attribute/text matches; hashed
     # classes are a last-resort fallback.
     # TODO: replace hashed class if Flipkart changes it
     "product_price": "div.Nx9bqj, div._30jeq3, div[class*='price']",
-    "product_image": "img[src*='rukmini'], img[src*='flixcart']",
     # ---- Flipkart Minutes "add to cart" feature (see flipkart_minutes_cart.py) ----
     # Minutes results are React-Native-Web rendered (hashed css-* classes, no
     # stable ids). Verified shape: each search result is an `a[href*="/p/itm"]`
@@ -371,14 +363,6 @@ async def dismiss_modal(page) -> None:
         print("[nav] Dismissed login modal.")
     except PlaywrightTimeoutError:
         pass
-
-
-async def is_logged_in(page) -> bool:
-    try:
-        await page.wait_for_selector(SELECTORS["logged_in_indicator"], timeout=4_000)
-        return True
-    except PlaywrightTimeoutError:
-        return False
 
 
 async def enter_otp_on_flipkart(page, otp: str) -> None:
@@ -1098,6 +1082,143 @@ async def _return_to_basket_expanded(page, basket_url: str) -> None:
         pass
 
 
+# One tile snapshot, two passes. Pass 1 anchors on Flipkart-CDN images and
+# walks up to the tile text (title + price) and wrapping anchor href. Pass 2
+# anchors on row TEXT — the 'See all items' modal renders every item row in
+# the DOM but lazy-loads its images, so rows below the fold never get a
+# rukmini <img> and pass 1 alone misses them (e.g. items 8+ of a 14-item
+# basket). Duplicates across passes are merged by text in Python.
+_BASKET_ITEMS_JS = r"""
+    () => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const out = [];
+
+      // Pass 1: image-anchored tiles.
+      const imgs = Array.from(document.querySelectorAll(
+        'img[src*="rukmini"]:not([src*="promos"]):not([src*="logos"]):not([src*="banner"])'
+      ));
+      for (const img of imgs) {
+        let cur = img;
+        let href = null;
+        for (let i = 0; i < 10 && cur; i++) {
+          // Capture the nearest ancestor anchor href, if any. Minutes
+          // tiles wrap their image+text in a single <a> pointing to the
+          // hyperlocal-preview-page URL (originalUrl param holds the
+          // canonical /p/itm... product URL).
+          if (!href && cur.tagName === 'A' && cur.href) {
+            href = cur.href;
+          }
+          const t = norm(cur.innerText);
+          if (t.length > 5 && t.length < 400 && t.includes('₹')) {
+            out.push({ text: t, src: img.src, href: href });
+            break;
+          }
+          cur = cur.parentElement;
+        }
+      }
+
+      // Pass 2: text-anchored rows — deepest containers holding a title,
+      // a ₹ price, and an order-status keyword. EXCL drops the price-summary
+      // rows ("Listing price ₹844" etc.) that also pair text with ₹.
+      const KEY = /(return|cancel|refund|replace|exchange|know more|delivered|rate)/i;
+      const EXCL = /^(listing price|selling price|total amount|price details|paid by|shipping|discount|platform|coupon|donation)/i;
+      const all = Array.from(document.querySelectorAll('div, a, li, section, article'));
+      const pred = el => {
+        const t = norm(el.innerText);
+        return t.length > 5 && t.length < 400 && t.includes('₹') &&
+               !t.startsWith('₹') && KEY.test(t) && !EXCL.test(t);
+      };
+      const matched = all.filter(pred);
+      const rows = matched.filter(el => !matched.some(o => o !== el && el.contains(o)));
+      for (const row of rows) {
+        const img = row.querySelector('img[src*="rukmini"]');
+        const a = row.querySelector('a[href*="/p/itm"], a[href*="hyperlocal-preview"]') || row.closest('a');
+        out.push({
+          text: norm(row.innerText),
+          src: img ? img.src : null,
+          href: a && a.href ? a.href : null,
+        });
+      }
+      return out;
+    }
+"""
+
+# Scroll one viewport down. scrollIntoView on the last tile also moves any
+# inner scrollable panel (the expanded 'See all items' list), which
+# window.scrollBy alone would not reach.
+_BASKET_SCROLL_STEP_JS = """
+    () => {
+      const imgs = document.querySelectorAll('img[src*="rukmini"]');
+      if (imgs.length) imgs[imgs.length - 1].scrollIntoView({ block: 'end' });
+      window.scrollBy(0, window.innerHeight);
+    }
+"""
+
+
+async def _collect_basket_items(page) -> list[dict]:
+    """Collect every item tile on a Minutes basket detail page.
+
+    The expanded 'See all items' list lazy-loads tile images and can
+    virtualize long lists, so a single DOM snapshot only sees the tiles near
+    the viewport — baskets with many items lost everything below the fold.
+    Scroll in steps, snapshot at each step, and merge by tile text until two
+    consecutive scrolls surface nothing new."""
+    collected: dict[str, dict] = {}
+    stall = 0
+    for _ in range(15):
+        batch = await page.evaluate(_BASKET_ITEMS_JS)
+        added = 0
+        for it in batch:
+            key = re.sub(r"\s+", " ", (it.get("text") or "")).strip().lower()
+            if key and key not in collected:
+                collected[key] = it
+                added += 1
+        if added == 0:
+            stall += 1
+            if stall >= 2:
+                break
+        else:
+            stall = 0
+        await page.evaluate(_BASKET_SCROLL_STEP_JS)
+        await page.wait_for_timeout(900)
+    try:
+        await page.evaluate("window.scrollTo(0, 0)")
+    except Exception:
+        pass
+    print(f"  [items] collected {len(collected)} tile(s) after scroll sweep")
+    return list(collected.values())
+
+
+async def _find_basket_tile(page, title: str, img_src: str):
+    """Resolve an item tile on the basket detail page. Prefers the anchor
+    wrapping the exact image captured during collection (stable identifier),
+    falling back to title text. Lazy/virtualized tiles only mount near the
+    viewport, so scroll down in steps until one resolves. Returns a Locator
+    or None."""
+    escaped = img_src.replace('"', '\\"') if img_src else ""
+    for attempt in range(8):
+        if escaped:
+            cand = page.locator(f'a:has(img[src="{escaped}"])').first
+            try:
+                if await cand.count() > 0:
+                    suffix = f" after {attempt} scroll step(s)" if attempt else ""
+                    print(f"  [tile] resolved by image anchor{suffix}")
+                    return cand
+            except Exception:
+                pass
+        cand = page.get_by_text(title, exact=False).first
+        try:
+            if await cand.count() > 0:
+                suffix = f" after {attempt} scroll step(s)" if attempt else ""
+                print(f"  [tile] resolved by text (fallback){suffix}")
+                return cand
+        except Exception:
+            pass
+        await page.evaluate(_BASKET_SCROLL_STEP_JS)
+        await page.wait_for_timeout(700)
+    return None
+
+
 async def scrape_minutes_basket(
     page, card, order_idx: int, total: int,
     details_cache: dict[str, dict] | None = None,
@@ -1145,34 +1266,7 @@ async def scrape_minutes_basket(
     # Remember the basket URL so we can return here between product-page clicks.
     basket_url = page.url
 
-    items = await page.evaluate(r"""
-        () => {
-          const imgs = Array.from(document.querySelectorAll(
-            'img[src*="rukmini"]:not([src*="promos"]):not([src*="logos"]):not([src*="banner"])'
-          ));
-          const out = [];
-          for (const img of imgs) {
-            let cur = img;
-            let href = null;
-            for (let i = 0; i < 10 && cur; i++) {
-              // Capture the nearest ancestor anchor href, if any. Minutes
-              // tiles wrap their image+text in a single <a> pointing to the
-              // hyperlocal-preview-page URL (originalUrl param holds the
-              // canonical /p/itm... product URL).
-              if (!href && cur.tagName === 'A' && cur.href) {
-                href = cur.href;
-              }
-              const t = (cur.innerText || '').replace(/\s+/g,' ').trim();
-              if (t.length > 5 && t.length < 400 && t.includes('₹')) {
-                out.push({ text: t, src: img.src, href: href });
-                break;
-              }
-              cur = cur.parentElement;
-            }
-          }
-          return out;
-        }
-    """)
+    items = await _collect_basket_items(page)
 
     # Deduplicate items within this basket. Capture price+href from the
     # basket page itself — Minutes SKUs route through a hyperlocal-preview
@@ -1236,70 +1330,64 @@ async def scrape_minutes_basket(
             await _return_to_basket_expanded(page, basket_url)
 
         # Resolve the tile to click. Prefer the anchor that wraps THE EXACT
-        # image we captured in JS (stable identifier); fall back to title text.
+        # image we captured in JS (stable identifier); fall back to title
+        # text. Lazy/virtualized tiles only mount near the viewport, so the
+        # finder scrolls down until the tile appears.
         print(f"\n  [tile {item_idx + 1}/{len(unique_items)}] {title[:55]}")
-        tile = None
-        img_src = it.get("basket_image") or ""
-        if img_src:
-            escaped = img_src.replace('"', '\\"')
-            cand = page.locator(f'a:has(img[src="{escaped}"])').first
-            if await cand.count() > 0:
-                tile = cand
-                print(f"  [tile] resolved by image anchor")
+        tile = await _find_basket_tile(page, title, it.get("basket_image") or "")
         if tile is None:
-            tile = page.get_by_text(title, exact=False).first
-            print(f"  [tile] resolved by text (fallback)")
-
-        try:
-            await tile.scroll_into_view_if_needed()
-            url_before = page.url
-            print(f"  [click] dispatching; url before = {url_before[:90]}")
-            await tile.click()
-
-            # Wait for the redirect chain to complete on /p/itm. If we never
-            # get there (Minutes preview gate, captcha, etc.), give the page
-            # a few more seconds and proceed with whatever URL we landed on.
+            print("  [tile] not found after scroll sweep; keeping basket fallback")
+        else:
             try:
-                await page.wait_for_url(
-                    re.compile(r"flipkart\.com/[^?#]*?/p/itm"),
-                    timeout=15_000,
-                )
-            except PlaywrightTimeoutError:
-                await page.wait_for_timeout(3_000)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=8_000)
-            except PlaywrightTimeoutError:
-                pass
-            await page.wait_for_timeout(700)
+                await tile.scroll_into_view_if_needed()
+                url_before = page.url
+                print(f"  [click] dispatching; url before = {url_before[:90]}")
+                await tile.click()
 
-            landed = page.url
-            print(f"  [settle] landed: {landed[:90]}")
-
-            if landed == url_before:
-                print(f"  [warn] click did not navigate; keeping basket fallback")
-            else:
-                # extract_product_details also unwraps any lingering preview URL.
-                page_details = await extract_product_details(page)
-
-                px = page_details.get("current_price")
-                if px is not None:
-                    details["current_price"] = px
-                    print(f"  [price] ₹{px} (from product page)")
-                else:
-                    print(
-                        f"  [price] product page yielded no price; "
-                        f"keeping basket ₹{details['current_price']}"
+                # Wait for the redirect chain to complete on /p/itm. If we never
+                # get there (Minutes preview gate, captcha, etc.), give the page
+                # a few more seconds and proceed with whatever URL we landed on.
+                try:
+                    await page.wait_for_url(
+                        re.compile(r"flipkart\.com/[^?#]*?/p/itm"),
+                        timeout=15_000,
                     )
-                if page_details.get("image_url"):
-                    details["image_url"] = page_details["image_url"]
-                # product_url := wherever we actually ended up — the URL a
-                # user can click to reach the page we just scraped.
-                if page_details.get("product_url"):
-                    details["product_url"] = page_details["product_url"]
-                    print(f"  [url] {details['product_url'][:90]}")
-                details["availability"] = page_details.get("availability", "Unavailable")
-        except Exception as exc:
-            print(f"  [error] click for {title[:40]} failed: {exc}")
+                except PlaywrightTimeoutError:
+                    await page.wait_for_timeout(3_000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8_000)
+                except PlaywrightTimeoutError:
+                    pass
+                await page.wait_for_timeout(700)
+
+                landed = page.url
+                print(f"  [settle] landed: {landed[:90]}")
+
+                if landed == url_before:
+                    print("  [warn] click did not navigate; keeping basket fallback")
+                else:
+                    # extract_product_details also unwraps any lingering preview URL.
+                    page_details = await extract_product_details(page)
+
+                    px = page_details.get("current_price")
+                    if px is not None:
+                        details["current_price"] = px
+                        print(f"  [price] ₹{px} (from product page)")
+                    else:
+                        print(
+                            f"  [price] product page yielded no price; "
+                            f"keeping basket ₹{details['current_price']}"
+                        )
+                    if page_details.get("image_url"):
+                        details["image_url"] = page_details["image_url"]
+                    # product_url := wherever we actually ended up — the URL a
+                    # user can click to reach the page we just scraped.
+                    if page_details.get("product_url"):
+                        details["product_url"] = page_details["product_url"]
+                        print(f"  [url] {details['product_url'][:90]}")
+                    details["availability"] = page_details.get("availability", "Unavailable")
+            except Exception as exc:
+                print(f"  [error] click for {title[:40]} failed: {exc}")
 
         cache[title] = dict(details)
         products.append({
@@ -1523,13 +1611,13 @@ async def run(num_orders: int, headless: bool) -> None:
                 f"  Screenshot : {screenshot_path.resolve()}\n"
                 f"  Order anchors on page: {diagnostic['anchorCount']}"
             )
-            print(f"\n  === Order anchor ancestors (anchor -> parent -> grandparent -> ...) ===")
+            print("\n  === Order anchor ancestors (anchor -> parent -> grandparent -> ...) ===")
             for i, info in enumerate(diagnostic["anchorInfo"]):
                 print(f"\n    Anchor #{i}: {info['href']}")
                 for level, a in enumerate(info["ancestors"]):
                     print(f"      L{level}: {a['tag']:<6}  cls='{a['cls']}'")
 
-            print(f"\n  === Product image ancestors ===")
+            print("\n  === Product image ancestors ===")
             for i, info in enumerate(diagnostic["imgInfo"]):
                 print(f"\n    Image #{i}: {info['src']}...")
                 for level, a in enumerate(info["ancestors"]):

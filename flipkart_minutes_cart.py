@@ -110,14 +110,17 @@ def best_match(
 # Flipkart Minutes navigation + search
 # ---------------------------------------------------------------------------
 
-async def _resolve_location(page) -> None:
+async def _resolve_location(page) -> bool:
     """Best-effort resolution of any Minutes delivery-location gate so search
     results and Add buttons render. Reuses the scraper's saved-address/pincode
-    helper."""
+    helper. Returns True iff a delivery-location prompt was actually handled
+    (callers reload the results grid afterwards, since selecting an address
+    re-renders or navigates away from it)."""
     try:
-        await _set_delivery_location_if_prompted(page)
+        return await _set_delivery_location_if_prompted(page)
     except Exception as exc:
         print(f"  [location] resolve failed (continuing): {exc}")
+        return False
 
 
 async def _collect_candidates(page) -> list[dict]:
@@ -157,21 +160,45 @@ async def _search_minutes(page, query: str) -> list[dict]:
     """Navigate to the Flipkart Minutes results for `query` and return candidate
     products [{title, href}]. Returns [] when no results render."""
     url = MINUTES_SEARCH_URL.format(q=quote_plus(query))
-    try:
-        await page.goto(url, wait_until="domcontentloaded")
-    except Exception as exc:
-        print(f"  [search] navigation failed: {exc}")
+    anchor_sel = SELECTORS["minutes_product_anchor"]
+
+    async def _goto_results() -> bool:
+        try:
+            await page.goto(url, wait_until="domcontentloaded")
+        except Exception as exc:
+            print(f"  [search] navigation failed: {exc}")
+            return False
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8_000)
+        except PlaywrightTimeoutError:
+            pass
+        await page.wait_for_timeout(1_500)
+        return True
+
+    if not await _goto_results():
         return []
 
+    # Results only render once a delivery location is resolved. Selecting a
+    # saved address re-renders (and clicking "Deliver here" reloads) the page,
+    # which can strand us off the results grid — so whenever we actually handle
+    # a location prompt, reload the search URL to land back on the grid. Repeat
+    # once in case the reload re-prompts; a resolved location persists in the
+    # context, so this settles quickly.
+    for _ in range(2):
+        if not await _resolve_location(page):
+            break
+        if not await _goto_results():
+            return []
+
+    # Headless servers (e.g. Railway) render the Minutes grid noticeably slower
+    # than a local headed run (which also injects slow_mo between actions), so a
+    # fixed short wait races the lazy-loaded results. Wait for the first product
+    # anchor to actually attach before collecting; tolerate a timeout, since some
+    # queries legitimately have no results.
     try:
-        await page.wait_for_load_state("networkidle", timeout=8_000)
+        await page.wait_for_selector(anchor_sel, state="attached", timeout=15_000)
     except PlaywrightTimeoutError:
         pass
-    await page.wait_for_timeout(1_500)
-
-    # Results need a resolved delivery location to render.
-    await _resolve_location(page)
-    await page.wait_for_timeout(500)
 
     return await _collect_candidates(page)
 

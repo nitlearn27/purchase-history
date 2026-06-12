@@ -25,9 +25,24 @@ records.
 | `POST` | `/api/products`  | Start a scrape in a background thread. Body: `{"orders": <int>}` (default 10). |
 | `GET`  | `/api/cart`      | Result of the last add-to-cart run: `{input, matched_title, score, status}[]`. |
 | `POST` | `/api/cart`      | Fuzzy-match names → add best match to the Flipkart Minutes cart (background thread, **no checkout**). Body: `{"products": ["name", ...]}`. |
+| `GET`  | `/api/search`    | Search Flipkart Minutes by name → top matches with price/image/url/availability. Query: `name` (required), `limit` (1–10, default 5). **Synchronous, read-only.** |
 
 A scrape takes 2–5 minutes. Poll `GET /api/products` until `status` flips from
 `running` to results.
+
+### Search Flipkart by name
+
+`GET /api/search?name=<product>&limit=<n>` logs in with the saved session,
+searches Flipkart Minutes, and returns the top `n` matches (ranked by relevance)
+with their current `current_price`, `product_url`, `image_url`, `availability`,
+`source` and `scraped_at`. It runs **synchronously** (login + one product-page
+visit per result, ~20–60s) and is **read-only** — it never carts or checks out.
+Order-history-only fields (last-ordered date, purchase count, last paid price,
+category) are omitted since they don't apply to a catalog search.
+
+```powershell
+Invoke-RestMethod "http://localhost:3000/api/search?name=Amul%20Gold%20Milk&limit=3"
+```
 
 ### Add to Minutes cart
 
@@ -122,6 +137,13 @@ Invoke-RestMethod http://localhost:3000/api/products
 ```powershell
 .venv\Scripts\python.exe flipkart_minutes_cart.py "Amul Gold Milk" "Aashirvaad Atta 5kg"
 .venv\Scripts\python.exe flipkart_minutes_cart.py "Tata Salt" --headed=false
+```
+
+### Search Flipkart Minutes directly (no Flask)
+
+```powershell
+.venv\Scripts\python.exe flipkart_search.py "Amul Gold Milk" --limit=5
+.venv\Scripts\python.exe flipkart_search.py "Tata Salt" --headed=false
 ```
 
 ### Re-sync the existing report to Salesforce (no re-scrape)

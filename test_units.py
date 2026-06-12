@@ -458,5 +458,61 @@ class MatchThresholdTests(unittest.TestCase):
             self.assertEqual(fmc.match_threshold(), 75.0)
 
 
+# ---------------------------------------------------------------------------
+# flipkart_search — candidate ranking + limit clamping (pure)
+# ---------------------------------------------------------------------------
+
+import flipkart_search as fs
+
+
+class RankCandidatesTests(unittest.TestCase):
+    def _cands(self):
+        return [
+            {"title": "Tata Salt 1kg", "href": "h1"},
+            {"title": "Amul Gold Full Cream Milk 500 ml", "href": "h2"},
+            {"title": "Amul Taaza Toned Milk 1 L", "href": "h3"},
+            {"title": "Maggi Noodles 70g", "href": "h4"},
+        ]
+
+    def test_most_relevant_ranked_first(self):
+        ranked = fs.rank_candidates("amul gold milk", self._cands(), limit=4)
+        self.assertEqual(ranked[0]["title"], "Amul Gold Full Cream Milk 500 ml")
+
+    def test_limit_truncates_results(self):
+        ranked = fs.rank_candidates("milk", self._cands(), limit=2)
+        self.assertEqual(len(ranked), 2)
+
+    def test_dicts_are_returned_unchanged(self):
+        # Ranking must preserve the href so the caller can open the product page.
+        ranked = fs.rank_candidates("amul gold milk", self._cands(), limit=1)
+        self.assertEqual(ranked[0]["href"], "h2")
+
+    def test_empty_query_returns_empty(self):
+        self.assertEqual(fs.rank_candidates("   ", self._cands(), limit=5), [])
+
+    def test_empty_candidates_returns_empty(self):
+        self.assertEqual(fs.rank_candidates("milk", [], limit=5), [])
+
+
+class ClampLimitTests(unittest.TestCase):
+    def test_none_uses_env_default(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(fs.clamp_limit(None), fs.DEFAULT_RESULTS_LIMIT)
+
+    def test_below_one_clamps_to_one(self):
+        self.assertEqual(fs.clamp_limit(0), 1)
+        self.assertEqual(fs.clamp_limit(-3), 1)
+
+    def test_above_max_clamps_to_max(self):
+        self.assertEqual(fs.clamp_limit(50), fs.MAX_RESULTS_LIMIT)
+
+    def test_string_value_is_coerced(self):
+        self.assertEqual(fs.clamp_limit("3"), 3)
+
+    def test_invalid_string_uses_default(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(fs.clamp_limit("abc"), fs.DEFAULT_RESULTS_LIMIT)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

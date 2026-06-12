@@ -49,6 +49,7 @@ for local development and cloud deployment on **Render** (Docker-based).
 ├── app.py                   # Flask web service (entry point) + Swagger UI at /docs
 ├── scrape_flipkart_orders.py  # Core scraping logic; calls salesforce_sync at end
 ├── flipkart_minutes_cart.py # Fuzzy-match product names → add to Flipkart Minutes cart
+├── flipkart_search.py       # Search Minutes by name → top matches with catalog details
 ├── salesforce_sync.py       # OAuth + PATCH Grocery_Product__c.title__c matches
 └── test_gmail_auth.py       # Standalone Gmail API auth test
 ```
@@ -88,6 +89,7 @@ for local development and cloud deployment on **Render** (Docker-based).
 | `PORT` | `10000` (Render sets this automatically) |
 | `CART_MATCH_THRESHOLD` | `60` — min fuzzy score (0–100) for `POST /api/cart` to accept a Minutes search result as a match |
 | `ORDERS_TO_SCRAPE` | `10` — fallback for both `scrape_flipkart_orders.py` (when `--orders` is omitted) and `POST /api/products` (when the request body omits `"orders"`). Explicit values still override. |
+| `SEARCH_RESULTS_LIMIT` | `5` — default result count for `flipkart_search.py` / `GET /api/search` when `--limit` / `?limit=` is omitted. Clamped to 1–10. |
 
 ## Environment Setup (Local)
 
@@ -135,6 +137,7 @@ $env:PORT="3000"; $env:HEADLESS="false"; .venv\Scripts\python.exe app.py
 | `POST` | `/api/products` | Start a scrape (runs in background thread). Body: `{"orders": <int>}`, default 10 |
 | `GET` | `/api/cart` | Result of the last add-to-cart run, per-product `{input, matched_title, score, status}` |
 | `POST` | `/api/cart` | Fuzzy-match names → add best match to Flipkart Minutes cart (background thread, no checkout). Body: `{"products": ["name", ...]}` |
+| `GET` | `/api/search` | Search Flipkart Minutes by name → top matches with `{product_name, current_price, product_url, image_url, availability, source, scraped_at}`. Query: `name` (required), `limit` (1–10, default 5). Synchronous, read-only. |
 
 Open `http://localhost:3000/docs` for the interactive playground (the `/` route
 redirects there). From there, every endpoint can be exercised with the
@@ -164,6 +167,13 @@ Invoke-RestMethod http://localhost:3000/api/products
 # Stops at the cart — never checks out. Tune matching with CART_MATCH_THRESHOLD.
 .venv\Scripts\python.exe flipkart_minutes_cart.py "Amul Gold Milk" "Aashirvaad Atta 5kg"
 .venv\Scripts\python.exe flipkart_minutes_cart.py "Tata Salt" --headed=false
+```
+
+### Search Flipkart Minutes by name (without Flask)
+
+```powershell
+.venv\Scripts\python.exe flipkart_search.py "Amul Gold Milk" --limit=5
+.venv\Scripts\python.exe flipkart_search.py "Tata Salt" --headed=false
 ```
 
 ### Test Gmail API auth
@@ -362,6 +372,7 @@ curl http://localhost:3000/api/products
 .venv/bin/python scrape_flipkart_orders.py --orders=5
 .venv/bin/python scrape_flipkart_orders.py --headed=false   # headless
 .venv/bin/python flipkart_minutes_cart.py "Amul Gold Milk" "Tata Salt"
+.venv/bin/python flipkart_search.py "Amul Gold Milk" --limit=5  # search Minutes by name
 .venv/bin/python salesforce_sync.py                     # re-sync orders_report.json
 .venv/bin/python -m unittest test_units.py -v           # offline unit tests
 ```

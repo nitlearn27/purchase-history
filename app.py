@@ -11,6 +11,8 @@ Endpoints:
                          current_price, product_url, image_url, category,
                          availability, source, scraped_at)
   POST /api/products   → start a scrape in a background thread (body: {"orders": <int>})
+  GET  /api/search     → search Flipkart Minutes by name (query: name, limit);
+                         returns top matches with price/image/url/availability
 """
 
 import asyncio
@@ -94,6 +96,11 @@ _cart_state = {
     "last_run_at": None,          # ISO timestamp
     "error": None,
 }
+
+# Guard for the synchronous Minutes search endpoint. The persistent browser
+# profile is single-session, so only one search may run at a time.
+_search_lock = threading.Lock()
+_search_state = {"running": False}
 
 
 def _run_scrape(num_orders: int) -> None:
@@ -338,6 +345,54 @@ def api_get_cart():
     }), 200
 
 
+@app.route("/api/search", methods=["GET"])
+def api_search():
+    """
+    Search Flipkart Minutes by product name and return the top matching products
+    with their current catalog details (price, image, URL, availability).
+
+    Query params:
+      name  (required) — free-text product name to search for.
+      limit (optional) — max results to return (1..10, default 5).
+
+    Runs synchronously — the request blocks while Flipkart is driven (login +
+    one product-page visit per result), typically 20-60s. Read-only: never carts.
+
+    Response (200): {query, count, scraped_at, products: [{product_name,
+      current_price, product_url, image_url, availability, source, scraped_at}]}.
+    Response (400) if name is missing/blank.
+    Response (409) if another search is already running.
+    Response (500) on an unexpected error.
+    """
+    name = (request.args.get("name") or "").strip()
+    if not name:
+        return jsonify({
+            "status": "error",
+            "message": "Query param 'name' is required and must be non-empty.",
+        }), 400
+
+    from flipkart_search import clamp_limit, search_products
+    limit = clamp_limit(request.args.get("limit"))
+
+    with _search_lock:
+        if _search_state["running"]:
+            return jsonify({
+                "status": "running",
+                "message": "A search is already in progress. Try again shortly.",
+            }), 409
+        _search_state["running"] = True
+
+    headless = os.getenv("HEADLESS", "true").lower() in ("true", "1", "yes")
+    try:
+        result = asyncio.run(search_products(name, limit=limit, headless=headless))
+        return jsonify(result), 200
+    except Exception as exc:
+        print(f"[search] Error: {exc}")
+        return jsonify({"status": "error", "error": str(exc)}), 500
+    finally:
+        _search_state["running"] = False
+
+
 # ---------------------------------------------------------------------------
 # OpenAPI 3.0 spec + Swagger UI served at /docs
 # ---------------------------------------------------------------------------
@@ -363,6 +418,7 @@ _OPENAPI_SPEC = {
         {"name": "scrape",   "description": "Trigger Flipkart scrapes."},
         {"name": "products", "description": "Read the latest scrape output."},
         {"name": "cart",     "description": "Add products to the Flipkart Minutes cart (no checkout)."},
+        {"name": "search",   "description": "Search Flipkart Minutes by product name (read-only)."},
     ],
     "paths": {
         "/health": {
@@ -519,6 +575,61 @@ _OPENAPI_SPEC = {
                 },
             },
         },
+        "/api/search": {
+            "get": {
+                "tags": ["search"],
+                "summary": "Search Flipkart Minutes by product name",
+                "description": (
+                    "Searches Flipkart Minutes for `name`, ranks results by fuzzy "
+                    "relevance, and returns the top matches with current price, image, "
+                    "URL and availability. Runs **synchronously** (20-60s: login + one "
+                    "product-page visit per result). Read-only — never carts or checks out."
+                ),
+                "parameters": [
+                    {
+                        "name": "name",
+                        "in": "query",
+                        "required": True,
+                        "schema": {"type": "string"},
+                        "description": "Free-text product name to search for.",
+                        "example": "Amul Gold Milk",
+                    },
+                    {
+                        "name": "limit",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+                        "description": "Max results to return (1-10, default 5).",
+                    },
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Search results.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/SearchOk"},
+                        }},
+                    },
+                    "400": {
+                        "description": "Missing or blank 'name' query param.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"},
+                        }},
+                    },
+                    "409": {
+                        "description": "A search is already running.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"},
+                        }},
+                    },
+                    "500": {
+                        "description": "The search errored.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"},
+                        }},
+                    },
+                },
+            },
+        },
     },
     "components": {
         "schemas": {
@@ -640,6 +751,30 @@ _OPENAPI_SPEC = {
                     "results": {
                         "type": "array",
                         "items": {"$ref": "#/components/schemas/CartResult"},
+                    },
+                },
+            },
+            "SearchResult": {
+                "type": "object",
+                "properties": {
+                    "product_name":  {"type": "string", "example": "Amul Gold Full Cream Milk 500 ml"},
+                    "current_price": {"type": "number", "nullable": True, "example": 35.0},
+                    "product_url":   {"type": "string", "nullable": True, "example": "https://www.flipkart.com/.../p/itm..."},
+                    "image_url":     {"type": "string", "nullable": True, "example": "https://rukminim2.flixcart.com/..."},
+                    "availability":  {"type": "string", "example": "Available"},
+                    "source":        {"type": "string", "example": "Flipkart"},
+                    "scraped_at":    {"type": "string", "format": "date-time"},
+                },
+            },
+            "SearchOk": {
+                "type": "object",
+                "properties": {
+                    "query":      {"type": "string", "example": "amul milk"},
+                    "count":      {"type": "integer", "example": 3},
+                    "scraped_at": {"type": "string", "format": "date-time"},
+                    "products": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/SearchResult"},
                     },
                 },
             },

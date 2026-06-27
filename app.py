@@ -360,7 +360,7 @@ def api_search():
     one product-page visit per result), typically 20-60s. Read-only: never carts.
 
     Response (200): {query, count, scraped_at, products: [{product_name,
-      current_price, product_url, image_url, availability, source, scraped_at}]}.
+      current_price, product_url, image_url, availability, source, scraped_at, weight}]}.
     Response (400) if name is missing/blank.
     Response (409) if another search is already running.
     Response (500) on an unexpected error.
@@ -766,6 +766,7 @@ _OPENAPI_SPEC = {
                     "availability":  {"type": "string", "example": "Available"},
                     "source":        {"type": "string", "example": "Flipkart"},
                     "scraped_at":    {"type": "string", "format": "date-time"},
+                    "weight":        {"type": "string", "nullable": True, "example": "500 gm"},
                 },
             },
             "SearchOk": {

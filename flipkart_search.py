@@ -35,6 +35,7 @@ from rapidfuzz import fuzz, utils
 from scrape_flipkart_orders import (
     FLIPKART_HOME,
     extract_product_details,
+    extract_weight,
     get_gmail_service,
     launch_logged_in_context,
 )
@@ -169,6 +170,7 @@ async def search_products(query: str, limit: int, headless: bool) -> dict:
                 "availability": "Unavailable",
                 "source": "Flipkart",
                 "scraped_at": scraped_at,
+                "weight": None,
             }
             try:
                 await page.goto(href, wait_until="domcontentloaded")
@@ -177,8 +179,20 @@ async def search_products(query: str, limit: int, headless: bool) -> dict:
                 entry["product_url"] = details.get("product_url") or href
                 entry["image_url"] = details.get("image_url")
                 entry["availability"] = details.get("availability", "Unavailable")
+
+                # Extract weight from details or candidate title
+                weight = None
+                page_title = details.get("page_title")
+                if page_title:
+                    weight = extract_weight(page_title)
+                if not weight or weight == "1 quantity":
+                    title_weight = extract_weight(title)
+                    if title_weight != "1 quantity" or not weight:
+                        weight = title_weight
+                entry["weight"] = weight
             except Exception as exc:
                 print(f"      [details] failed: {exc}")
+                entry["weight"] = extract_weight(title)
             products.append(entry)
 
         await context.close()
@@ -216,7 +230,8 @@ def main() -> None:
     print("\nResults:")
     for p in result["products"]:
         price = f"₹{p['current_price']}" if p["current_price"] is not None else "—"
-        print(f"  - {p['product_name']!r}  {price}  [{p['availability']}]")
+        weight = p.get("weight") or "—"
+        print(f"  - {p['product_name']!r}  {price}  ({weight})  [{p['availability']}]")
         print(f"    {p['product_url']}")
 
 

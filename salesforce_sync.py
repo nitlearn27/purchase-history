@@ -52,6 +52,7 @@ CATEGORY_FIELD = "category__c"
 AVAILABILITY_FIELD = "availability__c"
 SOURCE_FIELD = "source__c"
 SCRAPED_AT_FIELD = "scraped_at__c"
+WEIGHT_FIELD = "weight__c"
 
 _REQUIRED_ENV = ("SF_TOKEN_URL", "SF_CLIENT_ID", "SF_CLIENT_SECRET", "SF_API_ENDPOINT")
 _TOKEN_CACHE: dict[str, str] = {}
@@ -171,6 +172,7 @@ def _build_payload(entry: dict) -> dict:
     put(AVAILABILITY_FIELD, entry.get("availability"))
     put(SOURCE_FIELD, entry.get("source"))
     put(SCRAPED_AT_FIELD, entry.get("scraped_at"))
+    put(WEIGHT_FIELD, entry.get("weight"))
     return body
 
 
@@ -217,7 +219,7 @@ def _dedupe(products: Iterable[dict]) -> list[dict]:
         # Prefer non-empty values for the per-product page fields.
         for k in (
             "current_price", "last_purchased_price", "product_url", "image_url",
-            "category", "availability", "source", "scraped_at",
+            "category", "availability", "source", "scraped_at", "weight",
         ):
             if not cur.get(k) and merged.get(k):
                 cur[k] = merged[k]

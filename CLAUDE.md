@@ -350,6 +350,7 @@ to complete the Gmail OAuth consent (produces `token.json`).
 
 ```bash
 # Headed browser, server on http://localhost:3000
+source .venv/bin/activate
 PORT=3000 HEADLESS=false .venv/bin/python app.py
 ```
 

@@ -181,6 +181,7 @@ def _shape_products() -> list[dict]:
             "availability": p.get("availability"),
             "source": p.get("source"),
             "scraped_at": p.get("scraped_at"),
+            "weight": p.get("weight"),
         })
     return out
 
@@ -708,6 +709,7 @@ _OPENAPI_SPEC = {
                     "availability":              {"type": "string", "nullable": True, "example": "Available"},
                     "source":                    {"type": "string", "nullable": True, "example": "Flipkart"},
                     "scraped_at":                {"type": "string", "format": "date-time", "nullable": True},
+                    "weight":                    {"type": "string", "nullable": True, "example": "500 gm"},
                 },
             },
             "CartRequest": {

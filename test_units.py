@@ -58,6 +58,7 @@ class BuildPayloadTests(unittest.TestCase):
             "availability": "Available",
             "source": "Flipkart",
             "scraped_at": "2026-05-24T21:39:29+05:30",
+            "weight": "200 gm",
         }
 
     def test_full_row_includes_all_fields(self):
@@ -74,17 +75,20 @@ class BuildPayloadTests(unittest.TestCase):
         self.assertEqual(payload[sf.AVAILABILITY_FIELD], "Available")
         self.assertEqual(payload[sf.SOURCE_FIELD], "Flipkart")
         self.assertEqual(payload[sf.SCRAPED_AT_FIELD], "2026-05-24T21:39:29+05:30")
+        self.assertEqual(payload[sf.WEIGHT_FIELD], "200 gm")
 
     def test_none_values_are_omitted(self):
         row = self._full_row()
         row["current_price"] = None
         row["product_url"] = None
         row["image_url"] = None
+        row["weight"] = None
         payload = sf._build_payload(row)
         # None fields must be omitted so a partial retry doesn't blank existing data.
         self.assertNotIn(sf.PRICE_FIELD, payload)
         self.assertNotIn(sf.URL_FIELD, payload)
         self.assertNotIn(sf.IMAGE_FIELD, payload)
+        self.assertNotIn(sf.WEIGHT_FIELD, payload)
         # Other fields still present.
         self.assertIn(sf.COUNT_FIELD, payload)
         self.assertIn(sf.AVAILABILITY_FIELD, payload)
@@ -156,15 +160,16 @@ class DedupeTests(unittest.TestCase):
     def test_duplicate_titles_keep_latest_date_and_max_count(self):
         rows = [
             {"title": "Dup", "last_ordered_date": "2026-04-10",
-             "number_of_times_purchased": 1, "current_price": 9.0},
+             "number_of_times_purchased": 1, "current_price": 9.0, "weight": "500 gm"},
             {"title": "Dup", "last_ordered_date": "2026-05-15",
-             "number_of_times_purchased": 3, "current_price": None},
+             "number_of_times_purchased": 3, "current_price": None, "weight": None},
         ]
         out = sf._dedupe(rows)
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["last_ordered_date"], "2026-05-15")  # newest wins
         self.assertEqual(out[0]["number_of_times_purchased"], 3)     # max wins
         self.assertEqual(out[0]["current_price"], 9.0)                # non-empty preferred
+        self.assertEqual(out[0]["weight"], "500 gm")                 # non-empty preferred
 
     def test_duplicate_titles_availability_upgrade(self):
         # Two rows: an Unavailable first, then an Available second. The merge
@@ -365,6 +370,37 @@ class UnavailableFieldsTests(unittest.TestCase):
         self.assertIsNone(f["image_url"])
 
 
+class ExtractWeightTests(unittest.TestCase):
+    def test_kg_extraction(self):
+        self.assertEqual(sfo.extract_weight("Aashirvaad Atta 5kg"), "5 kg")
+        self.assertEqual(sfo.extract_weight("Atta 5 kg Whole Wheat"), "5 kg")
+        self.assertEqual(sfo.extract_weight("Organic Rice 2.5 Kilo"), "2.5 kg")
+        self.assertEqual(sfo.extract_weight("Flour 5.0 kg"), "5 kg")
+
+    def test_litre_extraction(self):
+        self.assertEqual(sfo.extract_weight("Fortune Oil 1L"), "1 litre")
+        self.assertEqual(sfo.extract_weight("Fortune Oil 1.5 ltr"), "1.5 litre")
+        self.assertEqual(sfo.extract_weight("Coconut water 200 ml"), "200 ml")
+        self.assertEqual(sfo.extract_weight("Milk 1.0 Litres"), "1 litre")
+
+    def test_gm_extraction(self):
+        self.assertEqual(sfo.extract_weight("Tata Salt 1kg"), "1 kg")
+        self.assertEqual(sfo.extract_weight("Maggi Noodles 70g"), "70 gm")
+        self.assertEqual(sfo.extract_weight("Butter 500 gm"), "500 gm")
+        self.assertEqual(sfo.extract_weight("Spice 100 Gms"), "100 gm")
+        self.assertEqual(sfo.extract_weight("Nandini Curd 200g"), "200 gm")
+
+    def test_pack_extraction(self):
+        self.assertEqual(sfo.extract_weight("Soap Pack of 4"), "4 quantity")
+        self.assertEqual(sfo.extract_weight("2 Pack Towels"), "2 quantity")
+        self.assertEqual(sfo.extract_weight("Pencils 10 pcs"), "10 quantity")
+        self.assertEqual(sfo.extract_weight("Erasers 5 Count"), "5 quantity")
+
+    def test_default_fallback(self):
+        self.assertEqual(sfo.extract_weight("Boat Airdopes 141"), "1 quantity")
+        self.assertEqual(sfo.extract_weight(""), "1 quantity")
+
+
 # ---------------------------------------------------------------------------
 # Output report shape (end-to-end on a synthetic all_products list)
 # ---------------------------------------------------------------------------
@@ -389,13 +425,14 @@ class ReportShapeTests(unittest.TestCase):
             "availability": "Available",
             "source": "Flipkart",
             "scraped_at": scraped_at,
+            "weight": "1 quantity",
         }
         # Salesforce payload from a full row must contain every __c field.
         payload = sf._build_payload(row)
         expected = {
             sf.COUNT_FIELD, sf.DATE_FIELD, sf.PRICE_FIELD, sf.LAST_PURCHASED_PRICE_FIELD,
             sf.URL_FIELD, sf.IMAGE_FIELD, sf.CATEGORY_FIELD, sf.AVAILABILITY_FIELD,
-            sf.SOURCE_FIELD, sf.SCRAPED_AT_FIELD,
+            sf.SOURCE_FIELD, sf.SCRAPED_AT_FIELD, sf.WEIGHT_FIELD,
         }
         self.assertEqual(set(payload.keys()), expected)
 

@@ -635,6 +635,81 @@ def _clean_minutes_product_title(raw: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+def extract_weight(title: str) -> str:
+    """
+    Extract weight, volume, or pack quantity from the product title.
+    Returns complete weight like '500 gm', '1 litre', '1 quantity', etc.
+    """
+    if not title:
+        return "1 quantity"
+
+    # Normalize space and convert to lowercase for easy matching
+    text = re.sub(r"\s+", " ", title).lower().strip()
+
+    # 1. Kilograms
+    m = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:kg|kilo|kilograms?)\b", text)
+    if m:
+        val = m.group(1)
+        if "." in val:
+            try:
+                f_val = float(val)
+                if f_val.is_integer():
+                    val = str(int(f_val))
+            except ValueError:
+                pass
+        return f"{val} kg"
+
+    # 2. Litres
+    m = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:litres?|ltrs?|l)\b", text)
+    if m:
+        val = m.group(1)
+        if "." in val:
+            try:
+                f_val = float(val)
+                if f_val.is_integer():
+                    val = str(int(f_val))
+            except ValueError:
+                pass
+        return f"{val} litre"
+
+    # 3. Grams
+    m = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:gms?|grams?|g)\b", text)
+    if m:
+        val = m.group(1)
+        if "." in val:
+            try:
+                f_val = float(val)
+                if f_val.is_integer():
+                    val = str(int(f_val))
+            except ValueError:
+                pass
+        return f"{val} gm"
+
+    # 4. Millilitres
+    m = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:ml|mls|millilitres?)\b", text)
+    if m:
+        val = m.group(1)
+        if "." in val:
+            try:
+                f_val = float(val)
+                if f_val.is_integer():
+                    val = str(int(f_val))
+            except ValueError:
+                pass
+        return f"{val} ml"
+
+    # 5. Pack / Quantity
+    m = re.search(r"\bpack\s+of\s+(\d+)\b", text)
+    if m:
+        return f"{m.group(1)} quantity"
+
+    m = re.search(r"\b(\d+)\s*(?:pack|pcs|pc|pieces?|units?|count|quantity)\b", text)
+    if m:
+        return f"{m.group(1)} quantity"
+
+    return "1 quantity"
+
+
 _UNAVAILABLE_TERMS = (
     "sold out",
     "out of stock",
@@ -953,7 +1028,7 @@ async def _unwrap_hyperlocal_preview(page) -> None:
 
 
 async def extract_product_details(page) -> dict:
-    """Capture price / image / url / availability from the currently-open product page."""
+    """Capture price / image / url / availability / title from the currently-open product page."""
     # Some product pages defer their price/image render — small idle wait helps.
     try:
         await page.wait_for_load_state("networkidle", timeout=6_000)
@@ -980,11 +1055,20 @@ async def extract_product_details(page) -> dict:
         # Price/availability typically update in-place after the check.
         await page.wait_for_timeout(800)
 
+    page_title = None
+    try:
+        h1_loc = page.locator("h1").first
+        if await h1_loc.count() > 0:
+            page_title = (await h1_loc.inner_text(timeout=2000)).strip()
+    except Exception:
+        pass
+
     return {
         "current_price": await _extract_current_price(page),
         "product_url": page.url,
         "image_url": await _extract_main_image(page),
         "availability": await _extract_availability(page),
+        "page_title": page_title,
     }
 
 
@@ -1385,6 +1469,8 @@ async def scrape_minutes_basket(
                     if page_details.get("product_url"):
                         details["product_url"] = page_details["product_url"]
                         print(f"  [url] {details['product_url'][:90]}")
+                    if page_details.get("page_title"):
+                        details["page_title"] = page_details["page_title"]
                     details["availability"] = page_details.get("availability", "Unavailable")
             except Exception as exc:
                 print(f"  [error] click for {title[:40]} failed: {exc}")
@@ -1691,7 +1777,7 @@ async def run(num_orders: int, headless: bool) -> None:
             if not cur.get("order_detail_url") and p.get("order_detail_url"):
                 cur["order_detail_url"] = p["order_detail_url"]
             # Prefer already-populated per-product fields from Minutes runs.
-            for k in ("current_price", "last_purchased_price", "product_url", "image_url"):
+            for k in ("current_price", "last_purchased_price", "product_url", "image_url", "page_title"):
                 if not cur.get(k) and p.get(k):
                     cur[k] = p[k]
             if cur.get("availability") == "Unavailable" and p.get("availability") == "Available":
@@ -1717,6 +1803,16 @@ async def run(num_orders: int, headless: bool) -> None:
     report_products = []
     for title, p in unique_by_title.items():
         date = p.get("date")
+        
+        # Calculate weight
+        weight = None
+        if p.get("page_title"):
+            weight = extract_weight(p["page_title"])
+        if not weight or weight == "1 quantity":
+            title_weight = extract_weight(p["title"])
+            if title_weight != "1 quantity" or not weight:
+                weight = title_weight
+
         report_products.append({
             "title": title,
             "last_ordered_date": None if not date or date == "unknown" else date,
@@ -1729,6 +1825,7 @@ async def run(num_orders: int, headless: bool) -> None:
             "availability": p.get("availability") or "Unavailable",
             "source": "Flipkart",
             "scraped_at": scraped_at,
+            "weight": weight,
         })
 
     report = {
@@ -1744,16 +1841,17 @@ async def run(num_orders: int, headless: bool) -> None:
 
     print(
         f"\n{'#':<4}  {'Product Title':<50}  {'Date':<12}  {'Cnt':<4}  "
-        f"{'Price':<8}  {'Cat':<12}  {'Avail'}"
+        f"{'Price':<8}  {'Weight':<12}  {'Cat':<12}  {'Avail'}"
     )
-    print("-" * 110)
+    print("-" * 125)
     for i, p in enumerate(report_products, 1):
         title = p["title"][:48] + ".." if len(p["title"]) > 50 else p["title"]
         price = "" if p["current_price"] is None else f"₹{p['current_price']}"
+        weight_str = p.get("weight") or "1 quantity"
         print(
             f"{i:<4}  {title:<50}  {str(p['last_ordered_date']):<12}  "
             f"{p['number_of_times_purchased']:<4}  {price:<8}  "
-            f"{str(p['category']):<12}  {p['availability']}"
+            f"{weight_str:<12}  {str(p['category']):<12}  {p['availability']}"
         )
 
     # ---- Push to Salesforce ----

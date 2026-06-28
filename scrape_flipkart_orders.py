@@ -1645,12 +1645,20 @@ async def launch_logged_in_context(pw, headless: bool, flipkart_email: str, gmai
     except ValueError:
         lat, lng = 12.9716, 77.5946
 
-    context = await browser.new_context(
-        storage_state=storage_state,
-        viewport={"width": 1400, "height": 900},
-        geolocation={"latitude": lat, "longitude": lng},
-        permissions=["geolocation"],
-    )
+    context_args = {
+        "storage_state": storage_state,
+        "viewport": {"width": 1400, "height": 900},
+        "geolocation": {"latitude": lat, "longitude": lng},
+        "permissions": ["geolocation"],
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+    
+    proxy_server = os.getenv("FLIPKART_PROXY")
+    if proxy_server:
+        context_args["proxy"] = {"server": proxy_server}
+        print(f"[auth] Routing browser traffic through proxy: {proxy_server}")
+
+    context = await browser.new_context(**context_args)
     page = await context.new_page()
 
     # ---- Login ----

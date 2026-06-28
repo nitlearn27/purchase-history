@@ -168,6 +168,7 @@ async def search_products(query: str, limit: int, headless: bool) -> dict:
                 "product_url": href,
                 "image_url": None,
                 "availability": "Unavailable",
+                "rating": None,
                 "source": "Flipkart",
                 "scraped_at": scraped_at,
                 "weight": None,
@@ -179,6 +180,7 @@ async def search_products(query: str, limit: int, headless: bool) -> dict:
                 entry["product_url"] = details.get("product_url") or href
                 entry["image_url"] = details.get("image_url")
                 entry["availability"] = details.get("availability", "Unavailable")
+                entry["rating"] = details.get("rating")
 
                 # Extract weight from details or candidate title
                 weight = None
@@ -231,7 +233,8 @@ def main() -> None:
     for p in result["products"]:
         price = f"₹{p['current_price']}" if p["current_price"] is not None else "—"
         weight = p.get("weight") or "—"
-        print(f"  - {p['product_name']!r}  {price}  ({weight})  [{p['availability']}]")
+        rating = f"  {p.get('rating')}★" if p.get('rating') is not None else ""
+        print(f"  - {p['product_name']!r}  {price}  ({weight}){rating}  [{p['availability']}]")
         print(f"    {p['product_url']}")
 
 

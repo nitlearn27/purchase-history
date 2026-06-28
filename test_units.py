@@ -59,6 +59,7 @@ class BuildPayloadTests(unittest.TestCase):
             "source": "Flipkart",
             "scraped_at": "2026-05-24T21:39:29+05:30",
             "weight": "200 gm",
+            "rating": 4.3,
         }
 
     def test_full_row_includes_all_fields(self):
@@ -76,6 +77,7 @@ class BuildPayloadTests(unittest.TestCase):
         self.assertEqual(payload[sf.SOURCE_FIELD], "Flipkart")
         self.assertEqual(payload[sf.SCRAPED_AT_FIELD], "2026-05-24T21:39:29+05:30")
         self.assertEqual(payload[sf.WEIGHT_FIELD], "200 gm")
+        self.assertEqual(payload[sf.RATING_FIELD], 4.3)
 
     def test_none_values_are_omitted(self):
         row = self._full_row()
@@ -83,12 +85,14 @@ class BuildPayloadTests(unittest.TestCase):
         row["product_url"] = None
         row["image_url"] = None
         row["weight"] = None
+        row["rating"] = None
         payload = sf._build_payload(row)
         # None fields must be omitted so a partial retry doesn't blank existing data.
         self.assertNotIn(sf.PRICE_FIELD, payload)
         self.assertNotIn(sf.URL_FIELD, payload)
         self.assertNotIn(sf.IMAGE_FIELD, payload)
         self.assertNotIn(sf.WEIGHT_FIELD, payload)
+        self.assertNotIn(sf.RATING_FIELD, payload)
         # Other fields still present.
         self.assertIn(sf.COUNT_FIELD, payload)
         self.assertIn(sf.AVAILABILITY_FIELD, payload)
@@ -160,9 +164,9 @@ class DedupeTests(unittest.TestCase):
     def test_duplicate_titles_keep_latest_date_and_max_count(self):
         rows = [
             {"title": "Dup", "last_ordered_date": "2026-04-10",
-             "number_of_times_purchased": 1, "current_price": 9.0, "weight": "500 gm"},
+             "number_of_times_purchased": 1, "current_price": 9.0, "weight": "500 gm", "rating": 4.3},
             {"title": "Dup", "last_ordered_date": "2026-05-15",
-             "number_of_times_purchased": 3, "current_price": None, "weight": None},
+             "number_of_times_purchased": 3, "current_price": None, "weight": None, "rating": None},
         ]
         out = sf._dedupe(rows)
         self.assertEqual(len(out), 1)
@@ -170,6 +174,7 @@ class DedupeTests(unittest.TestCase):
         self.assertEqual(out[0]["number_of_times_purchased"], 3)     # max wins
         self.assertEqual(out[0]["current_price"], 9.0)                # non-empty preferred
         self.assertEqual(out[0]["weight"], "500 gm")                 # non-empty preferred
+        self.assertEqual(out[0]["rating"], 4.3)                      # non-empty preferred
 
     def test_duplicate_titles_availability_upgrade(self):
         # Two rows: an Unavailable first, then an Available second. The merge
@@ -368,6 +373,7 @@ class UnavailableFieldsTests(unittest.TestCase):
         self.assertIsNone(f["current_price"])
         self.assertIsNone(f["product_url"])
         self.assertIsNone(f["image_url"])
+        self.assertIsNone(f["rating"])
 
 
 class ExtractWeightTests(unittest.TestCase):

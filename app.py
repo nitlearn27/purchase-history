@@ -9,10 +9,10 @@ Endpoints:
   GET  /api/products   → latest scrape output (full per-product field set:
                          product_name, date, number_of_times_purchased,
                          current_price, product_url, image_url, category,
-                         availability, source, scraped_at)
+                         availability, rating, source, scraped_at)
   POST /api/products   → start a scrape in a background thread (body: {"orders": <int>})
   GET  /api/search     → search Flipkart Minutes by name (query: name, limit);
-                         returns top matches with price/image/url/availability
+                         returns top matches with price/image/url/availability/rating
 """
 
 import asyncio
@@ -179,6 +179,7 @@ def _shape_products() -> list[dict]:
             "image_url": p.get("image_url"),
             "category": p.get("category"),
             "availability": p.get("availability"),
+            "rating": p.get("rating"),
             "source": p.get("source"),
             "scraped_at": p.get("scraped_at"),
             "weight": p.get("weight"),
@@ -360,7 +361,7 @@ def api_search():
     one product-page visit per result), typically 20-60s. Read-only: never carts.
 
     Response (200): {query, count, scraped_at, products: [{product_name,
-      current_price, product_url, image_url, availability, source, scraped_at, weight}]}.
+      current_price, product_url, image_url, availability, rating, source, scraped_at, weight}]}.
     Response (400) if name is missing/blank.
     Response (409) if another search is already running.
     Response (500) on an unexpected error.
@@ -583,7 +584,7 @@ _OPENAPI_SPEC = {
                 "description": (
                     "Searches Flipkart Minutes for `name`, ranks results by fuzzy "
                     "relevance, and returns the top matches with current price, image, "
-                    "URL and availability. Runs **synchronously** (20-60s: login + one "
+                    "URL, availability and rating. Runs **synchronously** (20-60s: login + one "
                     "product-page visit per result). Read-only — never carts or checks out."
                 ),
                 "parameters": [
@@ -707,6 +708,7 @@ _OPENAPI_SPEC = {
                     "image_url":                 {"type": "string", "nullable": True, "example": "https://rukminim2.flixcart.com/..."},
                     "category":                  {"type": "string", "nullable": True, "example": "Grocery"},
                     "availability":              {"type": "string", "nullable": True, "example": "Available"},
+                    "rating":                    {"type": "number", "nullable": True, "example": 4.3},
                     "source":                    {"type": "string", "nullable": True, "example": "Flipkart"},
                     "scraped_at":                {"type": "string", "format": "date-time", "nullable": True},
                     "weight":                    {"type": "string", "nullable": True, "example": "500 gm"},
@@ -764,6 +766,7 @@ _OPENAPI_SPEC = {
                     "product_url":   {"type": "string", "nullable": True, "example": "https://www.flipkart.com/.../p/itm..."},
                     "image_url":     {"type": "string", "nullable": True, "example": "https://rukminim2.flixcart.com/..."},
                     "availability":  {"type": "string", "example": "Available"},
+                    "rating":        {"type": "number", "nullable": True, "example": 4.3},
                     "source":        {"type": "string", "example": "Flipkart"},
                     "scraped_at":    {"type": "string", "format": "date-time"},
                     "weight":        {"type": "string", "nullable": True, "example": "500 gm"},

@@ -53,6 +53,7 @@ AVAILABILITY_FIELD = "availability__c"
 SOURCE_FIELD = "source__c"
 SCRAPED_AT_FIELD = "scraped_at__c"
 WEIGHT_FIELD = "weight__c"
+RATING_FIELD = "rating__c"
 
 _REQUIRED_ENV = ("SF_TOKEN_URL", "SF_CLIENT_ID", "SF_CLIENT_SECRET", "SF_API_ENDPOINT")
 _TOKEN_CACHE: dict[str, str] = {}
@@ -173,6 +174,7 @@ def _build_payload(entry: dict) -> dict:
     put(SOURCE_FIELD, entry.get("source"))
     put(SCRAPED_AT_FIELD, entry.get("scraped_at"))
     put(WEIGHT_FIELD, entry.get("weight"))
+    put(RATING_FIELD, entry.get("rating"))
     return body
 
 
@@ -219,7 +221,7 @@ def _dedupe(products: Iterable[dict]) -> list[dict]:
         # Prefer non-empty values for the per-product page fields.
         for k in (
             "current_price", "last_purchased_price", "product_url", "image_url",
-            "category", "availability", "source", "scraped_at", "weight",
+            "category", "availability", "source", "scraped_at", "weight", "rating",
         ):
             if not cur.get(k) and merged.get(k):
                 cur[k] = merged[k]
@@ -262,7 +264,8 @@ def sync_products(products: Iterable[dict]) -> dict:
                 f"date={entry.get('last_ordered_date')}  "
                 f"price={entry.get('current_price')}  "
                 f"last_purchased={entry.get('last_purchased_price')}  "
-                f"avail={entry.get('availability')}"
+                f"avail={entry.get('availability')}  "
+                f"rating={entry.get('rating')}"
             )
         except SalesforceError as exc:
             stats["errors"] += 1

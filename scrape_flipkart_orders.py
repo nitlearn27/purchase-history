@@ -724,6 +724,7 @@ def _unavailable_fields() -> dict:
         "product_url": None,
         "image_url": None,
         "availability": "Unavailable",
+        "rating": None,
     }
 
 
@@ -780,6 +781,53 @@ async def _extract_availability(page) -> str:
         return "Available"
     except Exception:
         return "Unavailable"
+
+
+async def _extract_rating(page) -> float | None:
+    """Extract product rating (e.g., 4.3) from the product page."""
+    try:
+        val = await page.evaluate(r"""
+            () => {
+                // 1. Try standard Flipkart first
+                const stdRating = document.querySelector('div.XQDdHH, div._3LWZlK');
+                if (stdRating) {
+                    const m = stdRating.innerText.match(/^([1-5](?:\.\d)?)/);
+                    if (m) return parseFloat(m[1]);
+                }
+                
+                // 2. Search for the first visible leaf element with a single decimal matching rating format [1-5].[0-9]
+                // but exclude elements inside similar/trending/recommended products containers
+                const elements = Array.from(document.querySelectorAll('*'));
+                for (const el of elements) {
+                    if (el.children.length === 0 && el.innerText) {
+                        const txt = el.innerText.trim();
+                        if (/^[1-5]\.[0-9]$/.test(txt)) {
+                            let isSimilar = false;
+                            let parent = el.parentElement;
+                            while (parent && parent.tagName !== 'BODY' && parent.tagName !== 'HTML') {
+                                const cls = (parent.className || '').toLowerCase();
+                                const id = (parent.id || '').toLowerCase();
+                                if (cls.includes('similar') || cls.includes('carousel') || cls.includes('recommend') || cls.includes('trending') ||
+                                    id.includes('similar') || id.includes('carousel') || id.includes('recommend') || id.includes('trending')) {
+                                    isSimilar = true;
+                                    break;
+                                }
+                                parent = parent.parentElement;
+                            }
+                            if (!isSimilar) {
+                                return parseFloat(txt);
+                            }
+                        }
+                    }
+                }
+                
+                return null;
+            }
+        """)
+        return val
+    except Exception as exc:
+        print(f"  [rating] extraction error: {exc}")
+        return None
 
 
 def _flipkart_pincode() -> str:
@@ -1068,6 +1116,7 @@ async def extract_product_details(page) -> dict:
         "product_url": page.url,
         "image_url": await _extract_main_image(page),
         "availability": await _extract_availability(page),
+        "rating": await _extract_rating(page),
         "page_title": page_title,
     }
 
@@ -1405,6 +1454,7 @@ async def scrape_minutes_basket(
             "product_url": it.get("basket_href") or None,
             "image_url": it.get("basket_image"),
             "availability": "Unavailable",
+            "rating": None,
         }
 
         # Make sure we're on the basket detail with 'See all items' expanded
@@ -1472,6 +1522,9 @@ async def scrape_minutes_basket(
                     if page_details.get("page_title"):
                         details["page_title"] = page_details["page_title"]
                     details["availability"] = page_details.get("availability", "Unavailable")
+                    if page_details.get("rating") is not None:
+                        details["rating"] = page_details["rating"]
+                        print(f"  [rating] {details['rating']}★")
             except Exception as exc:
                 print(f"  [error] click for {title[:40]} failed: {exc}")
 
@@ -1777,7 +1830,7 @@ async def run(num_orders: int, headless: bool) -> None:
             if not cur.get("order_detail_url") and p.get("order_detail_url"):
                 cur["order_detail_url"] = p["order_detail_url"]
             # Prefer already-populated per-product fields from Minutes runs.
-            for k in ("current_price", "last_purchased_price", "product_url", "image_url", "page_title"):
+            for k in ("current_price", "last_purchased_price", "product_url", "image_url", "page_title", "rating"):
                 if not cur.get(k) and p.get(k):
                     cur[k] = p[k]
             if cur.get("availability") == "Unavailable" and p.get("availability") == "Available":
@@ -1823,6 +1876,7 @@ async def run(num_orders: int, headless: bool) -> None:
             "image_url": p.get("image_url"),
             "category": p.get("category"),
             "availability": p.get("availability") or "Unavailable",
+            "rating": p.get("rating"),
             "source": "Flipkart",
             "scraped_at": scraped_at,
             "weight": weight,

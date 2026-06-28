@@ -137,7 +137,7 @@ $env:PORT="3000"; $env:HEADLESS="false"; .venv\Scripts\python.exe app.py
 | `POST` | `/api/products` | Start a scrape (runs in background thread). Body: `{"orders": <int>}`, default 10 |
 | `GET` | `/api/cart` | Result of the last add-to-cart run, per-product `{input, matched_title, score, status}` |
 | `POST` | `/api/cart` | Fuzzy-match names → add best match to Flipkart Minutes cart (background thread, no checkout). Body: `{"products": ["name", ...]}` |
-| `GET` | `/api/search` | Search Flipkart Minutes by name → top matches with `{product_name, current_price, product_url, image_url, availability, source, scraped_at}`. Query: `name` (required), `limit` (1–10, default 5). Synchronous, read-only. |
+| `GET` | `/api/search` | Search Flipkart Minutes by name → top matches with `{product_name, current_price, product_url, image_url, availability, rating, source, scraped_at}`. Query: `name` (required), `limit` (1–10, default 5). Synchronous, read-only. |
 
 Open `http://localhost:3000/docs` for the interactive playground (the `/` route
 redirects there). From there, every endpoint can be exercised with the
@@ -241,7 +241,8 @@ When a selector fails:
     {
       "title": "Boat Airdopes 141 Bluetooth Headset",
       "purchase_date": "2026-04-12",
-      "purchase_count_in_last_10_orders": 2
+      "purchase_count_in_last_10_orders": 2,
+      "rating": 4.3
     }
   ]
 }
@@ -311,7 +312,7 @@ Container starts
   user set). Tokens are cached in-process and refreshed on a 401.
 - Field mapping (hard-coded constants at the top of `salesforce_sync.py`):
   - Match field: `title__c`
-  - Updated fields: `number_of_times_purchased__c`, `last_ordered_date__c`
+  - Updated fields: `number_of_times_purchased__c`, `last_ordered_date__c`, `rating__c` (and other catalog attributes if present)
 - The Connected App must grant access to the `Grocery_Product__c` sObject and
   the `api` scope. `Name` is auto-number on this object and **must not** be sent
   in POST/PATCH bodies.
